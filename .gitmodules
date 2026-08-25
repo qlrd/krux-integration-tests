@@ -1,0 +1,4 @@
+[submodule "vendor/krux"]
+	path = vendor/krux
+	url = https://github.com/selfcustody/krux.git
+	branch = develop

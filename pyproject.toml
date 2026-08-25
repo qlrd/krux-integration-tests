@@ -1,0 +1,24 @@
+[project]
+name = "krux-integration-tests"
+version = "0.0.1"
+description = "Krux related integration tests"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "bornal",
+    "embit",
+    "pytest>=9.1.1",
+    "uUR",
+]
+
+[tool.uv.sources]
+bornal = { git = "https://github.com/qlrd/bornal.git" }
+embit = { path = "vendor/krux/vendor/embit", editable = true }
+uUR = { path = "vendor/krux/firmware/MaixPy/components/micropython/port/src/bc-ur" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["vendor/krux/src"]
