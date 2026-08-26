@@ -21,8 +21,14 @@ for _name in ("ucryptolib", "qrcode"):
 
 # pylint: disable=wrong-import-position  # must follow the shims above
 from embit.descriptor import checksum
+from embit.networks import NETWORKS
 from krux.wallet import Wallet
-from krux.key import Key
+from krux.key import Key, TYPE_SINGLESIG, P2PKH
+
+_VECTORS = (
+    " ".join(["abandon"] * 11 + ["about"]),
+    " ".join(["zoo"] * 11 + ["wrong"]),
+)
 
 
 @pytest.fixture
@@ -51,21 +57,11 @@ def airgap_wallet():
 
     return _wrapper
 
-
 @pytest.fixture
-def connect():
-    def _wrapper(source, dest, timeout: int = 30):
-        p2p_addr = "{}:{}".format(dest.daemon.host, dest.daemon.p2p_port)
-
-        rpc_s = source.client.call
-        rpc_d = dest.client.call
-        res = rpc_s("addnode", p2p_addr, "onetry")
-        assert res is None
-        die = time.monotonic() + timeout
-        while time.monotonic() < die:
-            if rpc_s("getblockcount") == rpc_d("getblockcount"):
-                return
-            time.sleep(0.25)
-        raise AssertionError("Nodes did not sync in '{}'".format(timeout))
-
-    return _wrapper
+def krux_p2pkh_wallets(airgap_wallet, output_script_descriptor):
+    wallets = []
+    for v in _VECTORS:
+        wallet = airgap_wallet(v, TYPE_SINGLESIG, NETWORKS["regtest"], P2PKH)
+        descrp = output_script_descriptor(wallet)
+        wallets.append((wallet, descrp))
+    return wallets
