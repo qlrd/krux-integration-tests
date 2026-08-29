@@ -75,124 +75,85 @@ in a scratch test only because ``MNEMONIC`` is the public BIP-39 reference vecto
 never combine ``watch_only=False`` with any other mnemonic.
 """
 
-import time
-
-from bornal.daemon import free_port
-from bornal.plugins.bitcoind import UNSPENDABLE_ADDRESS
 from bornal.testing import (
-    assert_wallet_roundtrip,
     assert_block_count,
     assert_chain,
+    generate_to_address,
 )
 
-# pylint: disable=wrong-import-position  # must follow the shims above
-from bornal.node import IntegrationTest
-from krux.wallet import Wallet
+
+def test_create(base_test, p2pkh_signers):
+    test = base_test("p2pkh", stop=False)
+    test.signers = p2pkh_signers
+
+    for b in test.backends:
+        assert_chain(b, "regtest")
+
+    test.mine_blocks()
+    test.connect_p2p(0, 1)
+    for b in test.backends[1:]:
+        assert_block_count(b, 101)
+
+    test.create_watchonly_wallet(test.backends[1], "krux-0", test.signers[0][1])
+
+    # test addresses
+    rpc = test.backends[1].client.call
+    core_addr = rpc("getnewaddress", "", "legacy")
+    krux_addr = next(test.signers[0][0].obtain_addresses())
+    test.log.info(
+        "(test_p2pkh::test_create) Bitcoin-core 'Watch-only' address: {}".format(
+            core_addr
+        )
+    )
+    test.log.info(
+        "(test_p2pkh::test_create) Krux 'Signer' address:             {}".format(
+            krux_addr
+        )
+    )
+    assert core_addr == krux_addr
 
 
-class p2pkhTest(IntegrationTest):
-    _signers: list[tuple[Wallet, str]] = []
+def test_receive(base_test):
+    test = base_test("p2pkh", stop=True)
+    rpc_core = test.backends[0].client.call
+    rpc_krux = test.backends[1].client.call
 
-    @property
-    def signers(self):
-        return self._signers
+    assert rpc_krux("getbalance") == 0
 
-    @signers.setter
-    def signers(self, value: list[tuple[Wallet, str]]):
-        if len(self._signers) == 0:
-            self._signers = value
-        else:
-            raise ValueError("Signers already set")
+    # get some new address  on core, copare with krux
+    addr = rpc_krux("getnewaddress", "", "legacy")
+    krux_addr = next(test.signers[0][0].obtain_addresses(i=1))
+    test.log.info(
+        "(test_p2pkh::test_receive) Bitcoin-core 'Watch-only' address: {}".format(addr)
+    )
+    test.log.info(
+        "(test_p2pkh::test_receive) Krux 'Signer' address:             {}".format(
+            krux_addr
+        )
+    )
+    assert addr == krux_addr
 
-    def set_test_params(self):
-        """Connect nodes throug a triangle network"""
-        self._p2p_ports = []
-        for _ in range(2):
-            p = free_port()
-            self._p2p_ports.append(p)
-            self.log.info(p)
-            self.add_backend(
-                "bitcoin-core", ["-listen=1", "-bind=127.0.0.1:{}".format(p)]
-            )
+    # send some amount from bornal-wallet to this address
+    amount = 1.5
+    txid = rpc_core("sendtoaddress", addr, amount)
+    test.log.info(
+        "(test_p2pkh::test_receive) Sent {} BTC to {} in {}".format(amount, addr, txid)
+    )
 
-    def run_test(self):
-        for b in self.backends:
-            assert_chain(b, "regtest")
+    # Generate more blocks so we can check balance
+    generate_to_address(test.backends[0], 1)
+    test.sync_blocks(0, 1)
+    assert_block_count(test.backends[1], 102)
 
-        self.mine_blocks()
-        self.connect_p2p(0, 1)
-        for b in self.backends[1:]:
-            assert_block_count(b, 101)
-
-        self.create_wallet(self.backends[0], "core-0", watch_only=False)
-        self.create_wallet(self.backends[1], "krux-0", self.signers[0][1], True)
-
-        # test addresses
-        rpc = self.backends[1].client.call
-        addr = rpc("getnewaddress", "", "legacy")
-        self.log.info("Bitcoin-core 'Watch-only' address: {}".format(addr))
-        self.log.info("Krux 'Signer' address:             {}".format(addr))
-        assert addr == next(self.signers[0][0].obtain_addresses())
-
-    def connect_p2p(self, i, j, timeout: int = 30):
-        src = self.backends[i]
-        dest = self.backends[j]
-        src_addr = "{}:{}".format(src.daemon.host, self._p2p_ports[i])
-        p2p_addr = "{}:{}".format(dest.daemon.host, self._p2p_ports[j])
-
-        rpc_s = src.client.call
-        rpc_d = dest.client.call
-
-        res = rpc_s("addnode", p2p_addr, "onetry")
-        assert res is None
-        self.log.info("Connected {} to {}".format(src_addr, p2p_addr))
-
-        die = time.monotonic() + timeout
-        while time.monotonic() < die:
-            if rpc_s("getblockcount") == rpc_d("getblockcount"):
-                self.log.info("Synced {} with {}".format(p2p_addr, src_addr))
-                return
-            time.sleep(0.25)
-        raise AssertionError("Nodes did not sync in '{}'".format(timeout))
-
-    def mine_blocks(self):
-        self.log.info("Mining 101 blocks to {}".format(UNSPENDABLE_ADDRESS))
-        assert_wallet_roundtrip(self.backends[0])
-        rpc = self.backends[0].client.call
-        assert rpc("listwallets") == ["bornal-wallet"]
-        self.log.info("default bornal-wallet created")
-
-    def create_wallet(
-        self,
-        backend,
-        name,
-        output_script_descriptor: str | None = None,
-        watch_only=True,
-    ):
-        rpc = backend.client.call
-        if watch_only:
-            if output_script_descriptor is None:
-                raise ValueError("output script descriptor cannot be None")
-            res = rpc("createwallet", name, True, True)
-            self.log.info("Wallet {} created. Importing descriptor...".format(name))
-            assert res["name"] == name
-            res = rpc(
-                "importdescriptors",
-                [
-                    {
-                        "desc": output_script_descriptor,
-                        "active": True,
-                        "timestamp": "now",
-                        "range": [0, 10],
-                    }
-                ],
-            )
-
-            assert all(r["success"] for r in res)
-            self.log.info("Descriptor {} imported".format(output_script_descriptor))
-
-
-def test_p2pkh(krux_p2pkh_wallets):
-    test = p2pkhTest()
-    test.signers = krux_p2pkh_wallets
-    test.main()
+    # check balance on bitcoin-core watch-only wallet
+    assert rpc_krux("getbalance") == amount
+    assert rpc_krux("getreceivedbyaddress", addr) == amount
+    unspent = rpc_krux("listunspent")
+    assert [
+        (u["txid"], u["address"], u["amount"], u["confirmations"]) for u in unspent
+    ] == [(txid, addr, amount, 1)]
+    test.log.info(
+        "(test_p2pkh::test_receive) Watch-only balance: {} BTC".format(
+            rpc_krux("getbalance")
+        )
+    )
