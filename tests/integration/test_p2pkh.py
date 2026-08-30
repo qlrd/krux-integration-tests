@@ -66,9 +66,9 @@ captures that log. A ``tprv`` descriptor passed to ``importdescriptors`` would
 land verbatim in the captured log, ``-o log_cli`` output and any CI artifact
 that keeps it.
 
-2. Persistence. Core writes imported keys to ``$INTEGRATION_TEMP_DIR/data/bitcoin-core<N>/regtest/wallets/``
-and bornal reuses those datadirs between runs, so the key would outlive the test
-on disk.
+2. Persistence. Core writes imported keys to
+``$INTEGRATION_TEMP_DIR/data/bitcoin-core<N>/regtest/wallets/`` and bornal
+reuses those datadirs between runs, so the key would outlive the test on disk.
 
 3. Fidelity. Krux is an air-gapped signer: Core must only ever see the public
 descriptor and receive signatures through a PSBT round-trip. Letting Core hold
@@ -92,7 +92,7 @@ from bornal.testing import (
 from embit.hashes import hash160
 
 TAG = "p2pkh"
-WALLET = "{}-krux-0".format(TAG)
+WALLET = f"{TAG}-krux-0"
 FUNDING = 1.5
 PAYMENT = 1.0
 LOG = "(test_p2pkh::{}) {}"
@@ -171,9 +171,7 @@ def test_005_change_addresses(base_test):
         info = rpc_krux("getaddressinfo", addr)
         assert info["ismine"] is True
         assert info["ischange"] is True
-        assert (
-            info["hdkeypath"].replace("'", "h") == signer.key.derivation + "/1/%d" % i
-        )
+        assert info["hdkeypath"].replace("'", "h") == signer.key.derivation + f"/1/{i}"
 
 
 def test_006_send_to_watchonly(base_test):
@@ -318,7 +316,7 @@ def test_014_psbt_unsigned(base_test, getpubkey):
     assert "partial_signatures" not in inp
     assert "final_scriptSig" not in inp
 
-    id = hash160(getpubkey(signer, 0, 1)).hex()
+    pkh = hash160(getpubkey(signer, 0, 1)).hex()
     analysis = rpc_krux("analyzepsbt", psbt)
     test.log.info(LOG.format("test_014_psbt_unsigned", analysis))
     assert analysis["next"] == "signer"
@@ -326,4 +324,4 @@ def test_014_psbt_unsigned(base_test, getpubkey):
         assert inp_analysis["has_utxo"] is True
         assert inp_analysis["is_final"] is False
         assert inp_analysis["next"] == "signer"
-        assert inp_analysis["missing"] == {"signatures": [id]}
+        assert inp_analysis["missing"] == {"signatures": [pkh]}

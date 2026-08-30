@@ -61,10 +61,8 @@ class BaseTest(IntegrationTest):
         for _ in range(2):
             p = free_port()
             self._p2p_ports.append(p)
-            self.log.info("p2p port {}".format(p))
-            self.add_backend(
-                "bitcoin-core", ["-listen=1", "-bind=127.0.0.1:{}".format(p)]
-            )
+            self.log.info(f"p2p port {p}")
+            self.add_backend("bitcoin-core", ["-listen=1", f"-bind=127.0.0.1:{p}"])
 
     def run_test(self):
         raise NotImplementedError("Implement please the test")
@@ -73,30 +71,30 @@ class BaseTest(IntegrationTest):
         """``addnode`` backend ``j`` from backend ``i`` and wait for both to sync"""
         src = self.backends[i]
         dest = self.backends[j]
-        src_addr = "{}:{}".format(src.daemon.host, self._p2p_ports[i])
-        p2p_addr = "{}:{}".format(dest.daemon.host, self._p2p_ports[j])
+        src_addr = f"{src.daemon.host}:{self._p2p_ports[i]}"
+        p2p_addr = f"{dest.daemon.host}:{self._p2p_ports[j]}"
 
         rpc_s = src.client.call
 
         res = rpc_s("addnode", p2p_addr, "onetry")
         assert res is None
-        self.log.info("Connected {} to {}".format(src_addr, p2p_addr))
+        self.log.info(f"Connected {src_addr} to {p2p_addr}")
         self.sync_blocks(i, j, timeout)
 
     def sync_blocks(self, i, j, timeout: int = 30):
         """Wait until backends ``i`` and ``j`` report the same block count"""
         rpc_s = self.backends[i].client.call
         rpc_d = self.backends[j].client.call
-        src_addr = "{}:{}".format(self.backends[i].daemon.host, self._p2p_ports[i])
-        p2p_addr = "{}:{}".format(self.backends[j].daemon.host, self._p2p_ports[j])
+        src_addr = f"{self.backends[i].daemon.host}:{self._p2p_ports[i]}"
+        p2p_addr = f"{self.backends[j].daemon.host}:{self._p2p_ports[j]}"
 
         die = time.monotonic() + timeout
         while time.monotonic() < die:
             if rpc_s("getblockcount") == rpc_d("getblockcount"):
-                self.log.info("Synced {} with {}".format(p2p_addr, src_addr))
+                self.log.info(f"Synced {p2p_addr} with {src_addr}")
                 return
             time.sleep(0.25)
-        raise AssertionError("Nodes did not sync in '{}'".format(timeout))
+        raise AssertionError(f"Nodes did not sync in '{timeout}'")
 
     def mine_blocks(self):
         """Create ``bornal-wallet`` on backend 0 and mine past coinbase maturity"""
@@ -111,23 +109,23 @@ class BaseTest(IntegrationTest):
         self,
         backend,
         name,
-        output_script_descriptor: str | None = None,
+        descriptor: str | None = None,
     ):
         """``createwallet`` with private keys disabled + ``importdescriptors``"""
         rpc = backend.client.call
-        if output_script_descriptor is None:
+        if descriptor is None:
             raise ValueError("output script descriptor cannot be None")
         res = rpc("createwallet", name, True, True)
-        self.log.info("Wallet {} created.".format(name))
+        self.log.info(f"Wallet {name} created.")
         if res["name"] != name:
-            raise AssertionError("Invalid '{}' wallet".format(res["name"]))
+            raise AssertionError(f"Invalid '{res['name']}' wallet")
 
-        self.log.info("Importing '{}'".format(output_script_descriptor))
+        self.log.info(f"Importing '{descriptor}'")
         res = rpc(
             "importdescriptors",
             [
                 {
-                    "desc": output_script_descriptor,
+                    "desc": descriptor,
                     "active": True,
                     "timestamp": "now",
                     "range": [0, 10],
@@ -136,14 +134,15 @@ class BaseTest(IntegrationTest):
         )
 
         if not all(r["success"] for r in res):
-            raise AssertionError("Invalid response: {}".format(res))
+            raise AssertionError(f"Invalid response: {res}")
 
     def stop_backends(self):
+        """Stop every backend, then re-raise the first failure (if any)"""
         errors = []
         for backend in self.backends:
             try:
                 backend.stop()
-            except Exception as exc:
+            except Exception as exc:  # pylint: disable=broad-exception-caught
                 errors.append(exc)
         self.backends = []
         if errors:
@@ -188,9 +187,7 @@ def output_script_descriptor():
 
     def _wrapper(wallet: Wallet, watch_only: bool = True):
         if wallet.descriptor is None:
-            raise ValueError(
-                "invalid null descriptor for {}".format(wallet.key.script_type)
-            )
+            raise ValueError(f"invalid null descriptor for {wallet.key.script_type}")
         desc = wallet.descriptor.to_string()
         if not watch_only:
             key = wallet.key
@@ -214,6 +211,7 @@ def airgap_wallet():
 
 
 @pytest.fixture
+# pylint: disable-next=redefined-outer-name
 def p2pkh_signers(airgap_wallet, output_script_descriptor):
     """``(wallet, descriptor)`` for each reference mnemonic, regtest p2pkh"""
     wallets = []
@@ -226,6 +224,8 @@ def p2pkh_signers(airgap_wallet, output_script_descriptor):
 
 @pytest.fixture
 def getpubkey():
+    """Compressed pubkey (``sec``) of ``signer`` at ``<account>/branch/index``"""
+
     def _wrapper(signer, branch, index):
         return signer.key.account.derive([branch, index]).key.sec()
 
