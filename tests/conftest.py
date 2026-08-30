@@ -42,6 +42,7 @@ class BaseTest(IntegrationTest):
         super().__init__(*args, **kwargs)
         self._signers: list[tuple[Wallet, str]] = []
         self._p2p_ports: list[int] = []
+        self.psbt: str | None = None
 
     @property
     def signers(self):

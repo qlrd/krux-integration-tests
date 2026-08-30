@@ -34,11 +34,12 @@ test_p2pkh.py
     strategy:
         - uses ``*(["abandon"] * 11) + ["about"])`` mnemonic
         - load its ``tpub`` descriptor through ``importdescriptor`` in core
-
-    todo:
         - create a core wallet to send coins to krux
         - krux should be able to inspect coins
-        - create a tx/unsigened tx with core
+        - create an unsigned tx (psbt) with core, from ``krux-0`` to bornal's
+          ``UNSPENDABLE_ADDRESS``, and keep it in ``BaseTest.psbt``
+
+    todo:
         - krux must sign the psbt
         - core imports signed psbt and broadcast
         - another core node should see krux tx
@@ -75,6 +76,7 @@ in a scratch test only because ``MNEMONIC`` is the public BIP-39 reference vecto
 never combine ``watch_only=False`` with any other mnemonic.
 """
 
+from bornal.plugins.bitcoind import UNSPENDABLE_ADDRESS
 from bornal.testing import (
     assert_block_count,
     assert_chain,
@@ -82,7 +84,7 @@ from bornal.testing import (
 )
 
 
-def test_create(base_test, p2pkh_signers):
+def test_000_create(base_test, p2pkh_signers):
     test = base_test("p2pkh", stop=False)
     test.signers = p2pkh_signers
 
@@ -113,8 +115,8 @@ def test_create(base_test, p2pkh_signers):
     assert core_addr == krux_addr
 
 
-def test_receive(base_test):
-    test = base_test("p2pkh", stop=True)
+def test_001_receive(base_test):
+    test = base_test("p2pkh", stop=False)
     rpc_core = test.backends[0].client.call
     rpc_krux = test.backends[1].client.call
 
@@ -157,3 +159,75 @@ def test_receive(base_test):
             rpc_krux("getbalance")
         )
     )
+
+
+def test_002_create_unsignedpsbt(base_test):
+    test = base_test("p2pkh", stop=True)
+    rpc_krux = test.backends[1].client.call
+    signer = test.signers[0][0]
+    amount = 1.0
+
+    # Create the psbt
+    res = rpc_krux(
+        "walletcreatefundedpsbt",
+        [],
+        [{UNSPENDABLE_ADDRESS: amount}],
+        0,
+        {"change_type": "legacy", "fee_rate": 1},
+    )
+
+    # Check if fee was less than base fee
+    test.log.info(
+        "(test_p2pkh::test_002_create_unsignedpsbt) walletcreatefundedpsbt {}".format(
+            res
+        )
+    )
+    assert 0 < res["fee"] < 0.0001
+
+    # Decode psbt and get its tx
+    psbt = res["psbt"]
+    decodedpsbt = rpc_krux("decodepsbt", psbt)
+    tx = decodedpsbt["tx"]
+    analysis = rpc_krux("analyzepsbt", psbt)
+    test.log.info(
+        "(test_p2pkh::test_002_create_unsignedpsbt) analysepsbt {}".format(analysis)
+    )
+
+    # List unspent coins to compare
+    (utxo,) = rpc_krux("listunspent")
+    assert [(i["txid"], i["vout"]) for i in tx["vin"]] == [(utxo["txid"], utxo["vout"])]
+    test.log.info("(test_p2pkh::test_002_create_unsignedpsbt) utxo: {}".format(utxo))
+
+    # the watch-only wallet and the signer must derive the same address
+    changepos = res["changepos"]
+    core_change = tx["vout"][changepos]["scriptPubKey"]["address"]
+    krux_change = next(signer.obtain_addresses(branch_index=1))
+    assert core_change == krux_change
+
+    # Check if the krux watch only have the same address information
+    info = rpc_krux("getaddressinfo", core_change)
+    test.log.info("(test_p2pkh::test_002_create_unsignedpsbt) info: {}".format(info))
+    assert info["ismine"] is True
+    assert info["ischange"] is True
+
+    # check if the tx outputs are the payment + that change, and amounts add up
+    outs = {o["scriptPubKey"]["address"]: o["value"] for o in tx["vout"]}
+    test.log.info("(test_p2pkh::test_002_create_unsignedpsbt) outputs: {}".format(outs))
+    assert outs[UNSPENDABLE_ADDRESS] == amount
+    assert outs[krux_change] < 0.5
+    assert round(sum(outs.values()) + res["fee"], 8) == utxo["amount"]
+
+    # check the inputs before sign
+    (inp,) = decodedpsbt["inputs"]
+    test.log.info("(test_p2pkh::test_002_create_unsignedpsbt) inputs: {}".format(inp))
+    assert "non_witness_utxo" in inp
+    assert (
+        inp["bip32_derivs"][0]["master_fingerprint"] == signer.key.fingerprint_hex_str()
+    )
+    assert "partial_signatures" not in inp
+    assert "final_scriptSig" not in inp
+    assert analysis["next"] == "signer"
+    assert analysis["inputs"][0]["is_final"] is False
+    assert analysis["inputs"][0]["next"] == "signer"
+
+    test.psbt = psbt
