@@ -11,7 +11,10 @@ dev = [
     "bornal",
     "embit",
     "pytest>=9.1.1",
+    "pylint>=4.0.5,<5",
     "uUR",
+    "poethepoet>=0.48.0",
+    "black>=26.5.1",
 ]
 
 [tool.uv.sources]
@@ -22,3 +25,46 @@ uUR = { path = "vendor/krux/firmware/MaixPy/components/micropython/port/src/bc-u
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["vendor/krux/src"]
+
+[tool.black]
+target-version = ["py312"]
+
+[tool.pylint.basic]
+no-docstring-rgx = "^(_|test_)"
+
+[tool.poe]
+executor.type = "uv"
+
+[tool.poe.env]
+PYTHONPATH = "${POE_ROOT}/vendor/krux/src${PYTHONPATH:+:${PYTHONPATH}}"
+
+[tool.poe.tasks.format]
+help = "format tests/ (use --check to report-only)"
+cmd = "black ${check:+--check --diff} tests/"
+executor = { type = "uv", with = "black==26.3.1"}
+args = [
+    { name = "check", options = ["--check", "-c"], type = "boolean", help = "report only"}
+]
+
+[tool.poe.tasks.lint]
+help = "lint tests/"
+cmd = "pylint tests/"
+executor = { type = "uv", with = "pylint>=4.0.5,<5"}
+
+[tool.poe.tasks.test-base]
+help = "test base check"
+cmd = "pytest --nproc ${nproc} --build-bitcoin ${bitcoin} ${debug:+--show-capture all --capture tee-sys} --wallet ${test:+tests/integration/test_${test}.py}"
+args = [
+    { name = "nproc", options = ["--nproc", "-j"], type = "integer", default = 8},
+    { name = "bitcoin", options = ["--bitcoin", "-B"], default = "latest"},
+    { name = "debug", options = ["--debug", "-d"], type = "boolean", help = "many verbose output about the test"},
+    { name = "test", options = ["--test", "-t"], help = "test module name"},
+]
+
+[tool.poe.tasks.tests]
+sequence = ["test-base -t p2pkh -j ${nproc} -B ${bitcoin} ${debug:+-d}"]
+args = [
+    { name = "nproc", options = ["--nproc", "-j"], type = "integer", default = 8},
+    { name = "bitcoin", options = ["--bitcoin", "-B"], default = "latest"},
+    { name = "debug", options = ["--debug", "-d"], type = "boolean", help = "many verbose output about the test"},
+]
