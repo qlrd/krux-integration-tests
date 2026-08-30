@@ -25,7 +25,12 @@ test_p2pkh.py
     summary:
         Model a basic interaction betwenn krux and bitcoin-core. 2 bitcoin nodes
         will be used, one as krux coordinator and another to inspect krux
-        signed txs.
+        signed txs.  The tests are are one and are chainable through a ordered
+        names and each and with the same pair of nodes
+        (``base_test("p2pkh", stop=False)``) that hands data to the next one.
+        Only the last test passes ``stop=True``. Run the whole module,
+        not a single test. Test should be small and auto-explainable most as
+        possible.
 
     targets:
         - bitcoin-core on regtest.
@@ -37,7 +42,7 @@ test_p2pkh.py
         - create a core wallet to send coins to krux
         - krux should be able to inspect coins
         - create an unsigned tx (psbt) with core, from ``krux-0`` to bornal's
-          ``UNSPENDABLE_ADDRESS``, and keep it in ``BaseTest.psbt``
+          ``UNSPENDABLE_ADDRESS``, and keep it in temporary memory
 
     todo:
         - krux must sign the psbt
@@ -78,156 +83,247 @@ never combine ``watch_only=False`` with any other mnemonic.
 
 from bornal.plugins.bitcoind import UNSPENDABLE_ADDRESS
 from bornal.testing import (
+    BASE_COINBASE_SUBSIDY,
+    COINBASE_MATURITY,
     assert_block_count,
     assert_chain,
     generate_to_address,
 )
+from embit.hashes import hash160
+
+TAG = "p2pkh"
+WALLET = "{}-krux-0".format(TAG)
+FUNDING = 1.5
+PAYMENT = 1.0
+LOG = "(test_p2pkh::{}) {}"
 
 
-def test_000_create(base_test, p2pkh_signers):
-    test = base_test("p2pkh", stop=False)
+def test_000_start(base_test, p2pkh_signers):
+    test = base_test(TAG, stop=False)
     test.signers = p2pkh_signers
-
     for b in test.backends:
         assert_chain(b, "regtest")
+        assert_block_count(b, 0)
+    assert len(test.signers) == 2
 
+
+def test_001_mine(base_test):
+    test = base_test(TAG, stop=False)
     test.mine_blocks()
+    assert_block_count(test.backends[0], COINBASE_MATURITY + 1)
+    assert test.backends[0].client.call("getbalance") >= BASE_COINBASE_SUBSIDY
+
+    # node 1 is not connected yet
+    assert_block_count(test.backends[1], 0)
+
+
+def test_002_connect(base_test):
+    test = base_test(TAG, stop=False)
     test.connect_p2p(0, 1)
-    for b in test.backends[1:]:
-        assert_block_count(b, 101)
+    for b in test.backends:
+        assert len(b.client.call("getpeerinfo")) == 1
+        assert_block_count(b, COINBASE_MATURITY + 1)
 
-    test.create_watchonly_wallet(test.backends[1], "krux-0", test.signers[0][1])
 
-    # test addresses
-    rpc = test.backends[1].client.call
-    core_addr = rpc("getnewaddress", "", "legacy")
+def test_003_create_watchonly_wallet(base_test):
+    test = base_test(TAG, stop=False)
+    rpc_krux = test.backends[1].client.call
+    test.create_watchonly_wallet(test.backends[1], WALLET, test.signers[0][1])
+    assert WALLET in rpc_krux("listwallets")
+    info = rpc_krux("getwalletinfo")
+    test.log.info(LOG.format("test_003_create_watchonly_wallet", info))
+    assert info["walletname"] == WALLET
+    assert info["descriptors"] is True
+    assert info["private_keys_enabled"] is False
+    assert rpc_krux("getbalance") == 0
+
+
+def test_004_receive_address_first(base_test):
+    test = base_test(TAG, stop=False)
+    core_addr = test.backends[1].client.call("getnewaddress", "", "legacy")
     krux_addr = next(test.signers[0][0].obtain_addresses())
     test.log.info(
-        "(test_p2pkh::test_create) Bitcoin-core 'Watch-only' address: {}".format(
-            core_addr
-        )
-    )
-    test.log.info(
-        "(test_p2pkh::test_create) Krux 'Signer' address:             {}".format(
-            krux_addr
-        )
+        LOG.format("test_004_receive_address", {"core": core_addr, "krux": krux_addr})
     )
     assert core_addr == krux_addr
 
 
-def test_001_receive(base_test):
-    test = base_test("p2pkh", stop=False)
+def test_005_change_addresses(base_test):
+    test = base_test(TAG, stop=False)
+    rpc_krux = test.backends[1].client.call
+    signer = test.signers[0][0]
+
+    (internal,) = [
+        d for d in rpc_krux("listdescriptors")["descriptors"] if d["internal"]
+    ]
+    test.log.info(LOG.format("test_005_change_address", internal))
+    assert internal["active"] is True
+    assert internal["next"] == 0
+
+    core_addrs = rpc_krux("deriveaddresses", internal["desc"], [0, 9])
+    krux_addrs = [next(signer.obtain_addresses(i=i, branch_index=1)) for i in range(10)]
+    test.log.info(
+        LOG.format("test_005_change_address", {"core": core_addrs, "krux": krux_addrs})
+    )
+    assert core_addrs == krux_addrs
+
+    for i, addr in enumerate(krux_addrs):
+        info = rpc_krux("getaddressinfo", addr)
+        assert info["ismine"] is True
+        assert info["ischange"] is True
+        assert (
+            info["hdkeypath"].replace("'", "h") == signer.key.derivation + "/1/%d" % i
+        )
+
+
+def test_006_send_to_watchonly(base_test):
+    test = base_test(TAG, stop=False)
     rpc_core = test.backends[0].client.call
     rpc_krux = test.backends[1].client.call
 
+    addr = rpc_krux("getnewaddress", "", "legacy")
+    assert addr == next(test.signers[0][0].obtain_addresses(i=1))
+
+    txid = rpc_core("sendtoaddress", addr, FUNDING)
+    test.log.info(
+        LOG.format(
+            "test_006_send_to_watchonly",
+            {"funding": FUNDING, "addr": addr, "txid": txid},
+        )
+    )
+    assert txid in rpc_core("getrawmempool")
     assert rpc_krux("getbalance") == 0
 
-    # get some new address  on core, copare with krux
-    addr = rpc_krux("getnewaddress", "", "legacy")
-    krux_addr = next(test.signers[0][0].obtain_addresses(i=1))
-    test.log.info(
-        "(test_p2pkh::test_receive) Bitcoin-core 'Watch-only' address: {}".format(addr)
-    )
-    test.log.info(
-        "(test_p2pkh::test_receive) Krux 'Signer' address:             {}".format(
-            krux_addr
-        )
-    )
-    assert addr == krux_addr
+    test.state["address"] = addr
+    test.state["txid"] = txid
 
-    # send some amount from bornal-wallet to this address
-    amount = 1.5
-    txid = rpc_core("sendtoaddress", addr, amount)
-    test.log.info(
-        "(test_p2pkh::test_receive) Sent {} BTC to {} in {}".format(amount, addr, txid)
-    )
 
-    # Generate more blocks so we can check balance
+def test_007_confirm(base_test):
+    test = base_test(TAG, stop=False)
+    rpc_core = test.backends[0].client.call
+    rpc_krux = test.backends[1].client.call
+
     generate_to_address(test.backends[0], 1)
     test.sync_blocks(0, 1)
-    assert_block_count(test.backends[1], 102)
+    for b in test.backends:
+        assert_block_count(b, COINBASE_MATURITY + 2)
+    assert rpc_core("getrawmempool") == []
+    assert rpc_krux("gettransaction", test.state["txid"])["confirmations"] == 1
 
-    # check balance on bitcoin-core watch-only wallet
-    assert rpc_krux("getbalance") == amount
-    assert rpc_krux("getreceivedbyaddress", addr) == amount
+
+def test_008_balance(base_test):
+    test = base_test(TAG, stop=False)
+    rpc_krux = test.backends[1].client.call
+    addr, txid = test.state["address"], test.state["txid"]
+
+    assert rpc_krux("getbalance") == FUNDING
+    assert rpc_krux("getreceivedbyaddress", addr) == FUNDING
     unspent = rpc_krux("listunspent")
+    test.log.info(LOG.format("test_008_balance", unspent))
     assert [
         (u["txid"], u["address"], u["amount"], u["confirmations"]) for u in unspent
-    ] == [(txid, addr, amount, 1)]
-    test.log.info(
-        "(test_p2pkh::test_receive) Watch-only balance: {} BTC".format(
-            rpc_krux("getbalance")
-        )
-    )
+    ] == [(txid, addr, FUNDING, 1)]
 
 
-def test_002_create_unsignedpsbt(base_test):
-    test = base_test("p2pkh", stop=True)
+def test_009_create_unsigned_psbt(base_test):
+    test = base_test(TAG, stop=False)
     rpc_krux = test.backends[1].client.call
-    signer = test.signers[0][0]
-    amount = 1.0
 
-    # Create the psbt
     res = rpc_krux(
         "walletcreatefundedpsbt",
         [],
-        [{UNSPENDABLE_ADDRESS: amount}],
+        [{UNSPENDABLE_ADDRESS: PAYMENT}],
         0,
         {"change_type": "legacy", "fee_rate": 1},
     )
-
-    # Check if fee was less than base fee
-    test.log.info(
-        "(test_p2pkh::test_002_create_unsignedpsbt) walletcreatefundedpsbt {}".format(
-            res
-        )
-    )
+    test.log.info(LOG.format("test_009_create_unsigned_psbt", res))
     assert 0 < res["fee"] < 0.0001
+    assert res["changepos"] != -1
 
-    # Decode psbt and get its tx
-    psbt = res["psbt"]
-    decodedpsbt = rpc_krux("decodepsbt", psbt)
-    tx = decodedpsbt["tx"]
-    analysis = rpc_krux("analyzepsbt", psbt)
-    test.log.info(
-        "(test_p2pkh::test_002_create_unsignedpsbt) analysepsbt {}".format(analysis)
-    )
+    test.state["psbt"] = res["psbt"]
+    test.state["changepos"] = res["changepos"]
+    test.state["fee"] = res["fee"]
 
-    # List unspent coins to compare
+
+def test_010_psbt_spends_utxo(base_test):
+    test = base_test(TAG, stop=False)
+    rpc_krux = test.backends[1].client.call
+    decoded = rpc_krux("decodepsbt", test.state["psbt"])
+
     (utxo,) = rpc_krux("listunspent")
-    assert [(i["txid"], i["vout"]) for i in tx["vin"]] == [(utxo["txid"], utxo["vout"])]
-    test.log.info("(test_p2pkh::test_002_create_unsignedpsbt) utxo: {}".format(utxo))
+    (vin,) = decoded["tx"]["vin"]
+    assert (vin["txid"], vin["vout"]) == (utxo["txid"], utxo["vout"])
 
-    # the watch-only wallet and the signer must derive the same address
-    changepos = res["changepos"]
-    core_change = tx["vout"][changepos]["scriptPubKey"]["address"]
+    (inp,) = decoded["inputs"]
+    prevout = inp["non_witness_utxo"]["vout"][utxo["vout"]]
+    assert inp["non_witness_utxo"]["txid"] == test.state["txid"]
+    assert prevout["value"] == FUNDING
+    assert prevout["scriptPubKey"]["address"] == test.state["address"]
+
+
+def test_011_psbt_change_address(base_test):
+    test = base_test(TAG, stop=False)
+    rpc_krux = test.backends[1].client.call
+    signer = test.signers[0][0]
+    decoded = rpc_krux("decodepsbt", test.state["psbt"])
+
+    changepos = test.state["changepos"]
+    core_change = decoded["tx"]["vout"][changepos]["scriptPubKey"]["address"]
     krux_change = next(signer.obtain_addresses(branch_index=1))
+    test.log.info(LOG.format("test_011_psbt_change_address", core_change))
     assert core_change == krux_change
 
-    # Check if the krux watch only have the same address information
     info = rpc_krux("getaddressinfo", core_change)
-    test.log.info("(test_p2pkh::test_002_create_unsignedpsbt) info: {}".format(info))
+    hdkeypath = info["hdkeypath"].replace("'", "h")
     assert info["ismine"] is True
     assert info["ischange"] is True
+    assert hdkeypath == signer.key.derivation + "/1/0"
 
-    # check if the tx outputs are the payment + that change, and amounts add up
-    outs = {o["scriptPubKey"]["address"]: o["value"] for o in tx["vout"]}
-    test.log.info("(test_p2pkh::test_002_create_unsignedpsbt) outputs: {}".format(outs))
-    assert outs[UNSPENDABLE_ADDRESS] == amount
-    assert outs[krux_change] < 0.5
-    assert round(sum(outs.values()) + res["fee"], 8) == utxo["amount"]
+    test.state["change"] = core_change
 
-    # check the inputs before sign
-    (inp,) = decodedpsbt["inputs"]
-    test.log.info("(test_p2pkh::test_002_create_unsignedpsbt) inputs: {}".format(inp))
-    assert "non_witness_utxo" in inp
-    assert (
-        inp["bip32_derivs"][0]["master_fingerprint"] == signer.key.fingerprint_hex_str()
-    )
+
+def test_012_psbt_outputs(base_test):
+    test = base_test(TAG, stop=False)
+    rpc_krux = test.backends[1].client.call
+    decoded = rpc_krux("decodepsbt", test.state["psbt"])
+
+    outs = {o["scriptPubKey"]["address"]: o["value"] for o in decoded["tx"]["vout"]}
+    test.log.info(LOG.format("test_012_psbt_outputs", outs))
+    assert set(outs) == {UNSPENDABLE_ADDRESS, test.state["change"]}
+    assert outs[UNSPENDABLE_ADDRESS] == PAYMENT
+    assert round(sum(outs.values()) + test.state["fee"], 8) == FUNDING
+
+
+def test_013_psbt_input_derivation(base_test, getpubkey):
+    test = base_test(TAG, stop=False)
+    rpc_krux = test.backends[1].client.call
+    signer = test.signers[0][0]
+    decoded = rpc_krux("decodepsbt", test.state["psbt"])
+
+    (inp,) = decoded["inputs"]
+    (deriv,) = inp["bip32_derivs"]
+    test.log.info(LOG.format("test_013_psbt_input_derivation", deriv))
+    assert deriv["pubkey"] == getpubkey(signer, 0, 1).hex()
+    assert deriv["master_fingerprint"] == signer.key.fingerprint_hex_str()
+    assert deriv["path"].replace("'", "h") == signer.key.derivation + "/0/1"
+
+
+def test_014_psbt_unsigned(base_test, getpubkey):
+    test = base_test(TAG, stop=True)
+    rpc_krux = test.backends[1].client.call
+    signer = test.signers[0][0]
+    psbt = test.state["psbt"]
+
+    (inp,) = rpc_krux("decodepsbt", psbt)["inputs"]
     assert "partial_signatures" not in inp
     assert "final_scriptSig" not in inp
-    assert analysis["next"] == "signer"
-    assert analysis["inputs"][0]["is_final"] is False
-    assert analysis["inputs"][0]["next"] == "signer"
 
-    test.psbt = psbt
+    id = hash160(getpubkey(signer, 0, 1)).hex()
+    analysis = rpc_krux("analyzepsbt", psbt)
+    test.log.info(LOG.format("test_014_psbt_unsigned", analysis))
+    assert analysis["next"] == "signer"
+    for inp_analysis in analysis["inputs"]:
+        assert inp_analysis["has_utxo"] is True
+        assert inp_analysis["is_final"] is False
+        assert inp_analysis["next"] == "signer"
+        assert inp_analysis["missing"] == {"signatures": [id]}

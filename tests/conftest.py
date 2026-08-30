@@ -42,7 +42,7 @@ class BaseTest(IntegrationTest):
         super().__init__(*args, **kwargs)
         self._signers: list[tuple[Wallet, str]] = []
         self._p2p_ports: list[int] = []
-        self.psbt: str | None = None
+        self.state: dict = {}
 
     @property
     def signers(self):
@@ -222,3 +222,11 @@ def p2pkh_signers(airgap_wallet, output_script_descriptor):
         descrp = output_script_descriptor(wallet)
         wallets.append((wallet, descrp))
     return wallets
+
+
+@pytest.fixture
+def getpubkey():
+    def _wrapper(signer, branch, index):
+        return signer.key.account.derive([branch, index]).key.sec()
+
+    return _wrapper
