@@ -53,13 +53,37 @@ see `bornal/paths.py`).
 The compilation was made to separate from your own bitcoin-core binaries, logs
 and data folders.
 
-Later runs reuse it (so will not recompile):
+```sh
+uv run poe tests                          # build (or reuse) bitcoind with wallet
+uv run poe tests -B 30.2 -j 8             # pin release and run compile parallelism
+uv run poe test-base -t p2pkh             # run only tests/integration/test_p2pkh.py
+uv run poe test-base -t p2pkh -- -k psbt  # anything after `--` goes to pytest
+```
+
+The plain `pytest` form still works and is what the tasks expand to:
 
 ```sh
-uv run pytest --build-bitcoin latest --wallet tests     # it build bitcoind (with wallet) then run
+uv run pytest --build-bitcoin latest --wallet tests     # it build bitcoind with wallet then run
 uv run pytest tests                                     # reuse the cached build
-uv run pytest --build-bitcoin 30.2 --nproc 8 tests      # pin a release, set compile parallelism
+uv run pytest --build-bitcoin 30.2 --nproc 8 tests      # pin release and compile parallelism
 ```
 
 Flags such as `--force-build` / `--preserve-data` are documented in
 `bornal`'s README.
+
+### Debug tests
+
+```sh
+uv run poe test-base -t p2pkh -d                          # live output for the whole module
+uv run poe test-base -t p2pkh -d -- -k test_004           # one test
+uv run poe test-base -t p2pkh -d -- -v                    # -v also turns on bornal's RPC log
+uv run poe test-base -t p2pkh -d -- --log-cli-level=DEBUG # everything the loggers emit
+```
+
+## Format and lint
+
+```sh
+uv run poe format        # black over tests/
+uv run poe format -c     # check only (what CI / reviewers run)
+uv run poe lint          # pylint over tests/ (krux.* resolves via [tool.poe.env])
+```
