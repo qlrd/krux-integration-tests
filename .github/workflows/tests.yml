@@ -1,0 +1,112 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "7 18 * * 6"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Init submodule vendors
+        run: |
+          git -C vendor/krux submodule update --init --depth 1 vendor/embit firmware/MaixPy
+          git -C vendor/krux/vendor/embit submodule update --init --depth 1 secp256k1/secp256k1-zkp
+          git -C vendor/krux/firmware/MaixPy submodule update --init --depth 1 components/micropython/port/src/bc-ur
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - run: uv sync --frozen
+      - run: uv run poe format -c
+      - run: uv run poe lint
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        bitcoin: ${{ github.event_name == 'schedule' && fromJSON('["29.2", "30.2", "31.1"]') || fromJSON('["31.1"]') }}
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+
+      - name: bitcoind build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkgconf python3 \
+            libboost-dev libevent-dev libsqlite3-dev
+
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Init submodule vendors
+        run: |
+          git -C vendor/krux submodule update --init --depth 1 vendor/embit firmware/MaixPy
+          git -C vendor/krux/vendor/embit submodule update --init --depth 1 secp256k1/secp256k1-zkp
+          git -C vendor/krux/firmware/MaixPy submodule update --init --depth 1 components/micropython/port/src/bc-ur
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Make secp256k1 on krux
+        working-directory: vendor/krux
+        run: |
+          uv sync --frozen
+          uv run poe secp256k1-build
+          uv run poe secp256k1-check
+
+      - name: Setup runner
+        run: echo "BORNAL_TEMP_DIR=$RUNNER_TEMP/bornal" >> "$GITHUB_ENV"
+
+      - name: Cache the bitcoind
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BORNAL_TEMP_DIR }}/binaries
+          key: bitcoind-${{ runner.os }}-${{ matrix.bitcoin }}-wallet-minsizerel
+
+      - run: uv sync --frozen
+
+      - name: Build/reuse bitcoind and test
+        run: uv run poe test-base -B ${{ matrix.bitcoin }} -j 4
+
+      - name: Upload debug.log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitcoind-debug-logs-${{ matrix.bitcoin }}
+          path: ${{ env.BORNAL_TEMP_DIR }}/data/**/regtest/debug.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Open issue on failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "Weekly tests failed ($(date -u +%F))" \
+            --body "See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
