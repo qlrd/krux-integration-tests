@@ -43,9 +43,13 @@ test_p2pkh.py
         - krux should be able to inspect coins
         - create an unsigned tx (psbt) with core, from ``krux-0`` to bornal's
           ``UNSPENDABLE_ADDRESS``, and keep it in temporary memory
+        - negative tests: wrong purpose, wrong network, wrong policy (not
+          broadcastable, rejectable
 
     todo:
-        - krux must sign the psbt
+        - negative tests: malformed psbt
+        - negative tests: malicious psbt
+        - krux must sign valid psbt
         - core imports signed psbt and broadcast
         - another core node should see krux tx
 
@@ -81,6 +85,8 @@ in a scratch test only because ``MNEMONIC`` is the public BIP-39 reference vecto
 never combine ``watch_only=False`` with any other mnemonic.
 """
 
+from pytest import raises
+from bornal.client import ClientError
 from bornal.plugins.bitcoind import UNSPENDABLE_ADDRESS
 from bornal.testing import (
     BASE_COINBASE_SUBSIDY,
@@ -90,12 +96,30 @@ from bornal.testing import (
     generate_to_address,
 )
 from embit.hashes import hash160
+from embit.networks import NETWORKS
+from krux.qr import FORMAT_NONE
+from krux.key import (
+    P2PKH,
+    P2WPKH,
+    P2SH,
+    P2SH_P2WSH,
+    P2WSH,
+    P2TR,
+    TYPE_SINGLESIG,
+    TYPE_MULTISIG,
+    TYPE_MINISCRIPT,
+)
 
 TAG = "p2pkh"
 WALLET = f"{TAG}-krux-0"
 FUNDING = 1.5
 PAYMENT = 1.0
 LOG = "(test_p2pkh::{}) {}"
+MISMATCHED = [
+    (NETWORKS["regtest"], P2WPKH),  # right net, wrong purpose: 84h
+    (NETWORKS["regtest"], P2TR),  # right net, wrong purpose: 86h
+    (NETWORKS["main"], P2PKH),  # wrong net, right purpose: 0h
+]
 
 
 def test_000_start(base_test, p2pkh_signers):
@@ -306,8 +330,8 @@ def test_013_psbt_input_derivation(base_test, getpubkey):
     assert deriv["path"].replace("'", "h") == signer.key.derivation + "/0/1"
 
 
-def test_014_psbt_unsigned(base_test, getpubkey):
-    test = base_test(TAG, stop=True)
+def test_014_psbt_unsigned(base_test, getpubkey, assert_unbroadcastable):
+    test = base_test(TAG, stop=False)
     rpc_krux = test.backends[1].client.call
     signer = test.signers[0][0]
     psbt = test.state["psbt"]
@@ -321,7 +345,134 @@ def test_014_psbt_unsigned(base_test, getpubkey):
     test.log.info(LOG.format("test_014_psbt_unsigned", analysis))
     assert analysis["next"] == "signer"
     for inp_analysis in analysis["inputs"]:
-        assert inp_analysis["has_utxo"] is True
-        assert inp_analysis["is_final"] is False
+        assert inp_analysis["has_utxo"]
+        assert not inp_analysis["is_final"]
         assert inp_analysis["next"] == "signer"
         assert inp_analysis["missing"] == {"signatures": [pkh]}
+    assert_unbroadcastable(test.backends[1], psbt)
+    test.log.info(
+        LOG.format(
+            "test_014_psbt_unsigned", {"message": "Not broadcastable", "psbt": psbt}
+        )
+    )
+
+
+def test_015_psbt_wrong_signer(base_test, psbtcopy, psbtsigner, assert_unbroadcastable):
+    test = base_test(TAG, stop=False)
+    wrong_signer = test.signers[1][0]
+    copied = psbtcopy(test.state["psbt"])
+    signer_krux = psbtsigner(wrong_signer, copied)
+    test.log.info(LOG.format("test_015_psbt_wrong_signer", signer_krux))
+
+    assert signer_krux.path_mismatch() == ""
+    with raises(ValueError, match="cannot sign"):
+        signer_krux.sign()
+
+    unsigned = signer_krux.psbt.to_string()
+    assert_unbroadcastable(test.backends[1], unsigned)
+    test.log.info(
+        LOG.format(
+            "test_015_psbt_wrong_signer",
+            {"message": "Not broadcastable", "psbt": unsigned},
+        )
+    )
+
+
+def test_016_psbt_invalid(base_test, psbtsigner):
+    test = base_test(TAG, stop=False)
+    rpc_krux = test.backends[1].client.call
+    wrong_signer = test.signers[0][0]
+    rawtx = rpc_krux("createrawtransaction", [], [{UNSPENDABLE_ADDRESS: 1}])
+
+    test.log.info(LOG.format("test_016_psbt_invalid", rawtx))
+    with raises(ValueError, match="invalid PSBT"):
+        psbtsigner(wrong_signer, rawtx)
+
+    with raises(ClientError, match="TX decode failed"):
+        rpc_krux("finalizepsbt", rawtx)
+
+
+def test_017_psbt_mismatch(
+    base_test, airgap_wallet, psbtcopy, psbtsigner, assert_unbroadcastable
+):
+    test = base_test(TAG, stop=False)
+    signer = test.signers[0][0]
+    assert psbtsigner(signer, test.state["psbt"]).path_mismatch() == ""
+
+    for net, purpose in MISMATCHED:
+        tmpwallet = airgap_wallet(signer.key.mnemonic, TYPE_SINGLESIG, net, purpose)
+        tmpsigner = psbtsigner(tmpwallet, psbtcopy(test.state["psbt"]))
+        test.log.info(LOG.format("test_017_psbt_mismatch", tmpwallet.key.derivation))
+        assert tmpsigner.path_mismatch() == "m/44h/1h/0h"
+
+        # Mimic the behaviour where a user declines "Proceed?" on the warning,
+        # so Krux signs nothing, and user try to broadcast eitherway
+        # the mismatch is a UX warning from core
+        unsigned = tmpsigner.psbt.to_string()
+        assert_unbroadcastable(test.backends[1], unsigned)
+        test.log.info(
+            LOG.format(
+                "test_017_psbt_mismatch",
+                {"message": "Not broadcastable", "psbt": unsigned},
+            )
+        )
+
+
+def test_018_psbt_wrong_policy(
+    base_test, airgap_wallet, psbtsigner, assert_unbroadcastable
+):
+    test = base_test(TAG, stop=False)
+    signer = test.signers[0][0]
+    cases = [
+        (TYPE_MULTISIG, P2SH, "Not a multisig PSBT"),
+        (TYPE_MULTISIG, P2SH_P2WSH, "Not a multisig PSBT"),
+        (TYPE_MULTISIG, P2WSH, "Not a multisig PSBT"),
+        (TYPE_MINISCRIPT, P2WSH, "Not a miniscript PSBT"),
+        (TYPE_MINISCRIPT, P2TR, "Not a miniscript PSBT"),
+    ]
+
+    for policy, purpose, err in cases:
+        tmpwallet = airgap_wallet(
+            signer.key.mnemonic, policy, NETWORKS["regtest"], purpose
+        )
+        test.log.info(
+            LOG.format("test_018_psbt_wrong_policy", tmpwallet.key.derivation)
+        )
+
+        with raises(ValueError, match=f"Invalid PSBT: {err}"):
+            psbtsigner(tmpwallet, test.state["psbt"])
+
+    assert_unbroadcastable(test.backends[1], test.state["psbt"])
+    test.log.info(
+        LOG.format(
+            "test_018_psbt_wrong_policy",
+            {"message": "Not broadcastable", "psbt": test.state["psbt"]},
+        )
+    )
+
+
+def test_019_psbt_mismatch_sign(
+    base_test, airgap_wallet, psbtcopy, psbtsigner, assert_rejects_finalizable
+):
+    # A path mismatch is a UX warning only. Krux signs and the same seed produces
+    # a valid signature that Core accepts. But rejected by core.
+    test = base_test(TAG, stop=True)
+    signer = test.signers[0][0]
+
+    for net, purpose in MISMATCHED:
+        tmpwallet = airgap_wallet(signer.key.mnemonic, TYPE_SINGLESIG, net, purpose)
+        tmpsigner = psbtsigner(tmpwallet, psbtcopy(test.state["psbt"]))
+        assert tmpsigner.path_mismatch() == "m/44h/1h/0h"
+
+        # The user taps "Proceed?" on the warning
+        tmpsigner.sign()
+        signed, fmt = tmpsigner.psbt_qr()
+        assert fmt == FORMAT_NONE
+
+        finalized = assert_rejects_finalizable(test.backends[1], signed)
+        test.log.info(
+            LOG.format(
+                "test_019_psbt_mismatch_still_signs",
+                {"derivation": tmpwallet.key.derivation, "finalized": finalized},
+            )
+        )

@@ -6,6 +6,7 @@ import random
 import sys
 import time
 import types
+from collections import namedtuple
 from unittest.mock import MagicMock
 
 import pytest
@@ -21,18 +22,33 @@ for _name in ("ucryptolib", "qrcode"):
     sys.modules.setdefault(_name, MagicMock())
 
 # pylint: disable=wrong-import-position
+from bornal.client import ClientError
 from bornal.daemon import free_port
 from bornal.node import IntegrationTest, env_data_dir
 from bornal.testing import assert_wallet_roundtrip
 from embit.descriptor import checksum
 from embit.networks import NETWORKS
+from embit.psbt import PSBT
 from krux.wallet import Wallet
-from krux.key import Key, TYPE_SINGLESIG, P2PKH
+from krux.key import Key, P2PKH, TYPE_SINGLESIG
+from krux.psbt import PSBTSigner
+from krux.qr import FORMAT_NONE
 
-_VECTORS = (
-    " ".join(["abandon"] * 11 + ["about"]),
-    " ".join(["zoo"] * 11 + ["wrong"]),
+TREZOR_BIP39_VECTOR = tuple(
+    [
+        " ".join(["abandon"] * 11 + ["about"]),
+        " ".join(["zoo"] * 11 + ["wrong"]),
+    ]
 )
+SMALL_FUNDING = 0.001
+
+
+@pytest.fixture
+def tdata():
+    """Reference vectors and amounts shared by the chains, like Krux's ``tdata``"""
+    return namedtuple("tdata", ["TREZOR_BIP39_VECTOR", "SMALL_FUNDING"])(
+        TREZOR_BIP39_VECTOR, SMALL_FUNDING
+    )
 
 
 class BaseTest(IntegrationTest):
@@ -212,10 +228,10 @@ def airgap_wallet():
 
 @pytest.fixture
 # pylint: disable-next=redefined-outer-name
-def p2pkh_signers(airgap_wallet, output_script_descriptor):
+def p2pkh_signers(airgap_wallet, output_script_descriptor, tdata):
     """``(wallet, descriptor)`` for each reference mnemonic, regtest p2pkh"""
     wallets = []
-    for v in _VECTORS:
+    for v in tdata.TREZOR_BIP39_VECTOR:
         wallet = airgap_wallet(v, TYPE_SINGLESIG, NETWORKS["regtest"], P2PKH)
         descrp = output_script_descriptor(wallet)
         wallets.append((wallet, descrp))
@@ -228,5 +244,62 @@ def getpubkey():
 
     def _wrapper(signer, branch, index):
         return signer.key.account.derive([branch, index]).key.sec()
+
+    return _wrapper
+
+
+@pytest.fixture
+def psbtcopy():
+    """Convert the psbt from a str to ``krux.psbt.PSBT`` instace."""
+
+    def _wrapper(psbt: str):
+        return PSBT.from_string(psbt)
+
+    return _wrapper
+
+
+@pytest.fixture
+def psbtsigner():
+    """Get the ``krux.psbt.PSBTSigner`` from a given wallet and arbitrary ``krux.psbt.PSBT``."""
+
+    def _wrapper(wallet: Wallet, psbt: PSBT | str) -> PSBTSigner:
+        data = psbt.to_string() if isinstance(psbt, PSBT) else psbt
+        return PSBTSigner(wallet, data, FORMAT_NONE)
+
+    return _wrapper
+
+
+@pytest.fixture
+def assert_rejects_finalizable():
+    """Core finalizes ``psbt`` and the mempool would accept it, but rejects."""
+
+    def _wrapper(backend, psbt: str):
+        rpc = backend.client.call
+        finalized = rpc("finalizepsbt", psbt)
+        assert finalized["complete"]
+        accepted = rpc("testmempoolaccept", [finalized["hex"]])[0]
+        assert accepted["allowed"], accepted.get("reject-reason")
+        return finalized
+
+    return _wrapper
+
+
+# add to bornal
+@pytest.fixture
+def assert_unbroadcastable():
+    """Check if core cannot finalize and the mempool rejects the unsigned tx"""
+
+    def _wrapper(backend, psbt: str):
+        rpc = backend.client.call
+        finalized = rpc("finalizepsbt", psbt)
+        assert not finalized["complete"]
+        assert "hex" not in finalized
+
+        analysis = rpc("analyzepsbt", psbt)
+        assert analysis["next"] == "signer"
+
+        unsigned = PSBT.from_string(psbt).tx.serialize().hex()
+        with pytest.raises(ClientError, match="mempool-script-verify-flag-failed"):
+            rpc("sendrawtransaction", unsigned)
 
     return _wrapper
