@@ -1,3 +1,6 @@
+[![tests](https://github.com/qlrd/krux-integration-tests/actions/workflows/tests.yml/badge.svg)](https://github.com/qlrd/krux-integration-tests/actions/workflows/tests.yml)
+![Python Version from PEP 621 TOML](https://img.shields.io/python/required-version-toml?tomlFilePath=https%3A%2F%2Fraw.githubusercontent.com%2Fqlrd%2Fkrux-integration-tests%2Fmain%2Fpyproject.toml)
+
 # krux-integration-tests
 
 Integration tests for the [Krux](https://github.com/selfcustody/krux)
