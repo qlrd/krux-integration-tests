@@ -51,12 +51,31 @@ jobs:
 
     steps:
 
+      - name: Setup runner
+        run: echo "BORNAL_TEMP_DIR=$RUNNER_TEMP/bornal" >> "$GITHUB_ENV"
+
+      - name: Cache the bitcoind
+        id: cache-bitcoind
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BORNAL_TEMP_DIR }}/binaries
+          key: bitcoind-${{ runner.os }}-${{ matrix.bitcoin }}-wallet-minsizerel
+
       - name: bitcoind build deps
+        if: steps.cache-bitcoind.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkgconf python3 \
             libboost-dev libevent-dev libsqlite3-dev
+
+      - name: bitcoind runtime deps
+        if: steps.cache-bitcoind.outputs.cache-hit == 'true'
+        run: |
+          if ldd "$BORNAL_TEMP_DIR/binaries/bitcoind" | grep -q "not found"; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends libevent-dev libsqlite3-dev
+          fi
 
       - uses: actions/checkout@v7
         with:
@@ -79,16 +98,8 @@ jobs:
           uv run poe secp256k1-build
           uv run poe secp256k1-check
 
-      - name: Setup runner
-        run: echo "BORNAL_TEMP_DIR=$RUNNER_TEMP/bornal" >> "$GITHUB_ENV"
-
-      - name: Cache the bitcoind
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.BORNAL_TEMP_DIR }}/binaries
-          key: bitcoind-${{ runner.os }}-${{ matrix.bitcoin }}-wallet-minsizerel
-
-      - run: uv sync --frozen
+      - name: Sync
+        run: uv sync --frozen
 
       - name: Build/reuse bitcoind and test
         run: uv run poe test-base -B ${{ matrix.bitcoin }} -j 4
