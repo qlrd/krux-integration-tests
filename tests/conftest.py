@@ -270,8 +270,8 @@ def psbtsigner():
 
 
 @pytest.fixture
-def assert_rejects_finalizable():
-    """Core finalizes ``psbt`` and the mempool would accept it, but rejects."""
+def assert_finalizable():
+    """Core finalizes ``psbt`` and the mempool would accept it."""
 
     def _wrapper(backend, psbt: str):
         rpc = backend.client.call

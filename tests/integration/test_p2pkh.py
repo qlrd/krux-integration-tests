@@ -452,10 +452,10 @@ def test_018_psbt_wrong_policy(
 
 
 def test_019_psbt_mismatch_sign(
-    base_test, airgap_wallet, psbtcopy, psbtsigner, assert_rejects_finalizable
+    base_test, airgap_wallet, psbtcopy, psbtsigner, assert_finalizable
 ):
     # A path mismatch is a UX warning only. Krux signs and the same seed produces
-    # a valid signature that Core accepts. But rejected by core.
+    # a valid signature that Core accepts.
     test = base_test(TAG, stop=True)
     signer = test.signers[0][0]
 
@@ -464,12 +464,15 @@ def test_019_psbt_mismatch_sign(
         tmpsigner = psbtsigner(tmpwallet, psbtcopy(test.state["psbt"]))
         assert tmpsigner.path_mismatch() == "m/44h/1h/0h"
 
-        # The user taps "Proceed?" on the warning
+        # Mimic the user tapping "Proceed?" on the warning at a krux device
         tmpsigner.sign()
         signed, fmt = tmpsigner.psbt_qr()
         assert fmt == FORMAT_NONE
 
-        finalized = assert_rejects_finalizable(test.backends[1], signed)
+        # It isn't recommended to do `sendrawtransaction` as pedagogical approach;
+        # instead, we call `finalizepsbt` and `testmempoolaccept` as a dry
+        # run and never broadcast.
+        finalized = assert_finalizable(test.backends[1], signed)
         test.log.info(
             LOG.format(
                 "test_019_psbt_mismatch_still_signs",
