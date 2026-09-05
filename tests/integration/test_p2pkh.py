@@ -46,7 +46,7 @@ test_p2pkh.py
         - negative tests: wrong purpose, wrong network, wrong policy (not
           broadcastable, rejectable)
         - malformed and malicious psbt: with or without fabricated tx or
-          non-standard sighashes
+          non-standard sighashes, outputs above inputs
     todo:
         - krux must sign valid psbt
         - core imports signed psbt and broadcast
@@ -481,10 +481,10 @@ def test_019_psbt_mismatch_sign(
         )
 
 
-# pylint: disable=too-many-locals
 def test_020_psbt_rejects_without_prev_tx(
     base_test, psbtcopy, psbtsigner, assert_unbroadcastable
 ):
+    # pylint: disable=too-many-locals
     test = base_test(TAG, stop=False)
     backend = test.backends[1]
     rpc_krux = backend.client.call
@@ -551,7 +551,7 @@ def test_021_psbt_malicious_prev_tx(base_test, psbtcopy, psbtsigner):
     # | spent               | 1.5        | 1.00000235               |
     # | outputs             | 1.0        | 1.0                      |
     # | fee on krux display | 0.5        | 0.00000235               |
-    test = base_test(TAG, stop=True)
+    test = base_test(TAG, stop=False)
     signer = test.signers[0][0]
     rpc_krux = test.backends[1].client.call
 
@@ -577,3 +577,83 @@ def test_021_psbt_malicious_prev_tx(base_test, psbtcopy, psbtsigner):
             {"message": "Not broadcastable", "psbt": declared},
         )
     )
+
+
+def test_022_psbt_outputs_exceeds_inputs(
+    base_test, psbtcopy, psbtsigner, assert_unbroadcastable
+):
+    test = base_test(TAG, stop=False)
+    signer = test.signers[0][0]
+    backend = test.backends[1]
+    rpc_krux = backend.client.call
+
+    # Try to spend more than what is capable
+    with raises(ClientError, match="Insufficient funds"):
+        rpc_krux(
+            "walletcreatefundedpsbt",
+            [],
+            [{UNSPENDABLE_ADDRESS: FUNDING + PAYMENT}],
+            0,
+            {"change_type": "legacy", "fee_rate": 1},
+        )
+
+    # modify the payment
+    # krux should be able to refuse to even create signer
+    copied = psbtcopy(test.state["psbt"])
+    copied.outputs[1 - test.state["changepos"]].value = copied.inputs[0].utxo.value + 1
+    with raises(ValueError, match="Invalid PSBT: outputs exceed inputs"):
+        psbtsigner(signer, copied)
+
+    # Core also check the negative fee applied and will ask for signer to check again
+    modified = copied.to_string()
+    analysis = rpc_krux("analyzepsbt", modified)
+    test.log.info(LOG.format("test_022_psbt_outputs_exceeds_inputs", analysis))
+    assert analysis["fee"] < 0
+    assert_unbroadcastable(backend, modified, rejectreason="bad-txns-in-belowout")
+    test.log.info(
+        LOG.format(
+            "test_022_psbt_outputs_exceeds_inputs",
+            {"message": "Not broadcastable", "psbt": modified},
+        )
+    )
+
+
+def test_023_psbt_sighash(base_test, psbtsigner, assert_unbroadcastable):
+    # similar to mitm above, change the sighash
+    test = base_test(TAG, stop=True)
+    backend = test.backends[1]
+    rpc_krux = backend.client.call
+    signer = test.signers[0][0]
+    cases = [("NONE", "0x02"), ("SINGLE", "0x03"), ("ALL|ANYONECANPAY", "0x81")]
+
+    # for each sighash, check in both krux and core the signs of malicious psbt
+    for i, (sighash, _hex) in enumerate(cases):
+        test.log.info(
+            LOG.format(
+                "test_023_psbt_sighash",
+                {"case": i, "sighash": {"key": sighash, "value": _hex}},
+            )
+        )
+        req = rpc_krux("walletprocesspsbt", test.state["psbt"], False, sighash)
+        (inputs,) = rpc_krux("decodepsbt", req["psbt"])["inputs"]
+        test.log.info(
+            LOG.format("test_023_psbt_sighash", {"psbt": req, "inputs": inputs})
+        )
+        assert not req["complete"]
+        assert inputs["sighash"] == sighash
+
+        # Krux will able to create the signer, but will refuse to sign
+        _krux = psbtsigner(signer, req["psbt"])
+        test.log.info(LOG.format("test_023_psbt_sighash", sighash))
+        with raises(ValueError, match=f"Input 0 has non-standard sighash type: {_hex}"):
+            _krux.sign()
+
+        # Core does not see it as signer's work done yet
+        unsigned = _krux.psbt.to_string()
+        assert_unbroadcastable(backend, unsigned, role="updater")
+        test.log.info(
+            LOG.format(
+                "test_023_psbt_sighash",
+                {"message": "Not broadcastable", "psbt": unsigned},
+            )
+        )
