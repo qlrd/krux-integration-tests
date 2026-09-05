@@ -44,11 +44,10 @@ test_p2pkh.py
         - create an unsigned tx (psbt) with core, from ``krux-0`` to bornal's
           ``UNSPENDABLE_ADDRESS``, and keep it in temporary memory
         - negative tests: wrong purpose, wrong network, wrong policy (not
-          broadcastable, rejectable
-
+          broadcastable, rejectable)
+        - malformed and malicious psbt: with or without fabricated tx or
+          non-standard sighashes
     todo:
-        - negative tests: malformed psbt
-        - negative tests: malicious psbt
         - krux must sign valid psbt
         - core imports signed psbt and broadcast
         - another core node should see krux tx
@@ -97,6 +96,7 @@ from bornal.testing import (
 )
 from embit.hashes import hash160
 from embit.networks import NETWORKS
+from embit.transaction import Transaction
 from krux.qr import FORMAT_NONE
 from krux.key import (
     P2PKH,
@@ -456,7 +456,7 @@ def test_019_psbt_mismatch_sign(
 ):
     # A path mismatch is a UX warning only. Krux signs and the same seed produces
     # a valid signature that Core accepts.
-    test = base_test(TAG, stop=True)
+    test = base_test(TAG, stop=False)
     signer = test.signers[0][0]
 
     for net, purpose in MISMATCHED:
@@ -479,3 +479,101 @@ def test_019_psbt_mismatch_sign(
                 {"derivation": tmpwallet.key.derivation, "finalized": finalized},
             )
         )
+
+
+# pylint: disable=too-many-locals
+def test_020_psbt_rejects_without_prev_tx(
+    base_test, psbtcopy, psbtsigner, assert_unbroadcastable
+):
+    test = base_test(TAG, stop=False)
+    backend = test.backends[1]
+    rpc_krux = backend.client.call
+    signer = test.signers[0][0]
+    err = "Invalid PSBT: missing non_witness_utxo on a legacy input"
+
+    # 1) coordinator attaches no UTXO data at all
+    (utxo,) = rpc_krux("listunspent")
+    barepsbt = rpc_krux(
+        "createpsbt",
+        [{"txid": utxo["txid"], "vout": utxo["vout"]}],
+        [{UNSPENDABLE_ADDRESS: PAYMENT}],
+    )
+    test.log.info(LOG.format("test_020_psbt_rejects_without_prev_tx", barepsbt))
+    with raises(ValueError, match=err):
+        psbtsigner(signer, barepsbt)
+
+    (analysis,) = rpc_krux("analyzepsbt", barepsbt)["inputs"]
+    assert not analysis["has_utxo"]
+    assert_unbroadcastable(backend, barepsbt, role="updater")
+
+    # 2) only coordinator could repair the psbt
+    updated = rpc_krux("utxoupdatepsbt", barepsbt)
+    (inp,) = rpc_krux("decodepsbt", updated)["inputs"]
+    assert "non_witness_utxo" not in inp
+
+    repaired = rpc_krux("walletprocesspsbt", updated, False)
+    (inp,) = rpc_krux("decodepsbt", repaired["psbt"])["inputs"]
+    assert not repaired["complete"]
+    assert "non_witness_utxo" in inp
+    assert psbtsigner(signer, repaired["psbt"]).path_mismatch() == ""
+
+    # 3) amount through witness_utxo instead of proving it with the previous tx
+    # and krux will refuse and core will wanna updated psbt
+    copied = psbtcopy(test.state["psbt"])
+    (inp,) = copied.inputs
+    inp.witness_utxo = inp.non_witness_utxo.vout[inp.vout]
+    inp.non_witness_utxo = None
+    with raises(ValueError, match=err):
+        psbtsigner(signer, copied)
+    declared = copied.to_string()
+    analysis = rpc_krux("analyzepsbt", declared)
+    test.log.info(LOG.format("test_020_psbt_rejects_without_prev_tx", analysis))
+    assert analysis["inputs"][0]["has_utxo"]
+    assert analysis["fee"] == test.state["fee"]
+    assert_unbroadcastable(backend, declared, role="updater")
+    test.log.info(
+        LOG.format(
+            "test_020_psbt_rejects_without_prev_tx",
+            {
+                "message": "Not broadcastable",
+                "psbt": {"raw": declared, "analysis": analysis},
+            },
+        )
+    )
+
+
+def test_021_psbt_malicious_prev_tx(base_test, psbtcopy, psbtsigner):
+    # supose that coordinator lies in the previous tx
+    # (name, real val, malicious coordinator val)
+    # this could happen:
+    # | desc                | real chain | fake on real chain       |
+    # | ------------------- | ---------- | ------------------------ |
+    # | spent               | 1.5        | 1.00000235               |
+    # | outputs             | 1.0        | 1.0                      |
+    # | fee on krux display | 0.5        | 0.00000235               |
+    test = base_test(TAG, stop=True)
+    signer = test.signers[0][0]
+    rpc_krux = test.backends[1].client.call
+
+    # an attacker could consider that the signature is still valid on krux
+    # (sighash never included amount). If faked, the aim is to half coins go to
+    # miner and the device show nothing. Krux will refuse to even start the
+    # signature procedure.
+    copied = psbtcopy(test.state["psbt"])
+    fake_prev = Transaction.parse(copied.inputs[0].non_witness_utxo.serialize())
+    fake_prev.vout[copied.inputs[0].vout].value //= 2
+    copied.inputs[0].non_witness_utxo = fake_prev
+    with raises(ValueError, match="Invalid PSBT: Previous txid doesn't match"):
+        psbtsigner(signer, copied)
+
+    # Core refuses to parse too
+    declared = copied.to_string()
+    with raises(ClientError, match="Non-witness UTXO does not match outpoint hash"):
+        rpc_krux("decodepsbt", declared)
+
+    test.log.info(
+        LOG.format(
+            "test_021_psbt_malicious_prev_tx",
+            {"message": "Not broadcastable", "psbt": declared},
+        )
+    )

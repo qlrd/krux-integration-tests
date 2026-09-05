@@ -289,17 +289,22 @@ def assert_finalizable():
 def assert_unbroadcastable():
     """Check if core cannot finalize and the mempool rejects the unsigned tx"""
 
-    def _wrapper(backend, psbt: str):
+    def _wrapper(
+        backend,
+        psbt: str,
+        role: str = "signer",
+        rejectreason: str = "mempool-script-verify-flag-failed",
+    ):
         rpc = backend.client.call
         finalized = rpc("finalizepsbt", psbt)
         assert not finalized["complete"]
         assert "hex" not in finalized
 
         analysis = rpc("analyzepsbt", psbt)
-        assert analysis["next"] == "signer"
+        assert analysis["next"] == role
 
         unsigned = PSBT.from_string(psbt).tx.serialize().hex()
-        with pytest.raises(ClientError, match="mempool-script-verify-flag-failed"):
+        with pytest.raises(ClientError, match=rejectreason):
             rpc("sendrawtransaction", unsigned)
 
     return _wrapper
