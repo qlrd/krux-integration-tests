@@ -293,7 +293,7 @@ def assert_unbroadcastable():
         backend,
         psbt: str,
         role: str = "signer",
-        rejectreason: str = "mempool-script-verify-flag-failed",
+        rejectreason: str = r"(mempool|mandatory)-script-verify-flag-failed",
     ):
         rpc = backend.client.call
         finalized = rpc("finalizepsbt", psbt)
