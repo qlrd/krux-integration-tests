@@ -23,13 +23,13 @@
 test_p2pkh.py
 
     summary:
-        Model a basic interaction betwenn krux and bitcoin-core. 2 bitcoin nodes
-        will be used, one as krux coordinator and another to inspect krux
-        signed txs.  The tests are are one and are chainable through a ordered
-        names and each and with the same pair of nodes
-        (``base_test("p2pkh", stop=False)``) that hands data to the next one.
-        Only the last test passes ``stop=True``. Run the whole module,
-        not a single test. Test should be small and auto-explainable most as
+        Model a basic interaction between krux and bitcoin-core. 2 bitcoin nodes
+        are used: ``core`` (hot ``bornal-wallet``: mines and funds) and
+        ``watchonly`` (Krux's ``tpub`` descriptor, no private keys). bornal's
+        module-scoped ``integration_test`` keeps both up until the module's
+        last test, so the tests are small, ordered by name and hand data to
+        the next one through the ``state`` dict. Run the whole module, not a
+        single test. Test should be small and auto-explainable most as
         possible.
 
     targets:
@@ -37,11 +37,11 @@ test_p2pkh.py
         - krux.wallet module
 
     strategy:
-        - uses ``*(["abandon"] * 11) + ["about"])`` mnemonic
-        - load its ``tpub`` descriptor through ``importdescriptor`` in core
+        - uses the Trezor BIP-39 vectors as ``alice`` (abandon) and ``bob`` (zoo)
+        - load each ``tpub`` descriptor into its own watch-only wallet on one node
         - create a core wallet to send coins to krux
         - krux should be able to inspect coins
-        - create an unsigned tx (psbt) with core, from ``krux-0`` to bornal's
+        - create an unsigned tx (psbt) with core, from ``alice`` to bornal's
           ``UNSPENDABLE_ADDRESS``, and keep it in temporary memory
         - negative tests: wrong purpose, wrong network, wrong policy (not
           broadcastable, rejectable)
@@ -55,36 +55,10 @@ test_p2pkh.py
 Build the daemon and run this test with the bornal's ``pytest`` plugin::
 
     pytest --build-bitcoin latest --wallet tests/integration/test_p2pkh.py
-
-SECURITY NOTE -- keep the Core side of the airgap wallet WATCH-ONLY.
-
-``output_script_descriptor(wallet)`` defaults to ``watch_only=True`` and hands
-Core a descriptor that carries only the ``tpub``. Passing ``watch_only=False``
-swaps the ``tpub`` for the ``tprv`` (see ``tests/conftest.py::output_script_descriptor``),
-i.e. it gives Core the private key. Do not do that here, for three reasons:
-
-1. Logging. bornal's RPC client logs every call *with its parameters* at DEBUG
-level (``bornal/client.py``: ``"$ rpc %s %s", method, params``), and pytest
-captures that log. A ``tprv`` descriptor passed to ``importdescriptors`` would
-land verbatim in the captured log, ``-o log_cli`` output and any CI artifact
-that keeps it.
-
-2. Persistence. Core writes imported keys to
-``$INTEGRATION_TEMP_DIR/data/bitcoin-core<N>/regtest/wallets/`` and bornal
-reuses those datadirs between runs, so the key would outlive the test on disk.
-
-3. Fidelity. Krux is an air-gapped signer: Core must only ever see the public
-descriptor and receive signatures through a PSBT round-trip. Letting Core hold
-the ``tprv`` would let a test "pass" without Krux signing anything.
-
-The ``krux`` wallet above is created with ``disable_private_keys=True``, so
-Core itself refuses a private-key import ("Cannot import private keys to a wallet
-with private keys disabled") -- keep that flag as a guard. All of this is tolerable
-in a scratch test only because ``MNEMONIC`` is the public BIP-39 reference vector;
-never combine ``watch_only=False`` with any other mnemonic.
 """
 
 from pytest import raises
+
 from bornal.client import ClientError
 from bornal.plugins.bitcoind import UNSPENDABLE_ADDRESS
 from bornal.testing import (
@@ -92,11 +66,24 @@ from bornal.testing import (
     COINBASE_MATURITY,
     assert_block_count,
     assert_chain,
+    assert_finalized,
+    assert_mempool_accepts,
+    assert_next_role,
+    assert_not_finalized,
+    assert_send_rawtx_rejects,
+    assert_wallet_info,
+    connect_p2p,
+    create_wallet,
     generate_to_address,
+    get_new_address,
+    sync_blocks,
 )
+
 from embit.hashes import hash160
 from embit.networks import NETWORKS
+from embit.psbt import PSBT
 from embit.transaction import Transaction
+
 from krux.qr import FORMAT_NONE
 from krux.key import (
     P2PKH,
@@ -110,11 +97,10 @@ from krux.key import (
     TYPE_MINISCRIPT,
 )
 
-TAG = "p2pkh"
-WALLET = f"{TAG}-krux-0"
+ALICE = "alice"
+BOB = "bob"
 FUNDING = 1.5
 PAYMENT = 1.0
-LOG = "(test_p2pkh::{}) {}"
 MISMATCHED = [
     (NETWORKS["regtest"], P2WPKH),  # right net, wrong purpose: 84h
     (NETWORKS["regtest"], P2TR),  # right net, wrong purpose: 86h
@@ -122,307 +108,277 @@ MISMATCHED = [
 ]
 
 
-def test_000_start(base_test, p2pkh_signers):
-    test = base_test(TAG, stop=False)
-    test.signers = p2pkh_signers
-    for b in test.backends:
-        assert_chain(b, "regtest")
-        assert_block_count(b, 0)
-    assert len(test.signers) == 2
+def unsigned_hex(psbt: str) -> str:
+    """Raw hex of the transaction ``psbt`` carries, signatures left out"""
+    return PSBT.from_string(psbt).tx.serialize().hex()
 
 
-def test_001_mine(base_test):
-    test = base_test(TAG, stop=False)
-    test.mine_blocks()
-    assert_block_count(test.backends[0], COINBASE_MATURITY + 1)
-    assert test.backends[0].client.call("getbalance") >= BASE_COINBASE_SUBSIDY
-
-    # node 1 is not connected yet
-    assert_block_count(test.backends[1], 0)
+def test_000_start(core, coordinator):
+    assert_chain(core, "regtest")
+    assert_chain(coordinator.backend, "regtest")
+    assert_block_count(core, 0)
+    assert_block_count(coordinator.backend, 0)
 
 
-def test_002_connect(base_test):
-    test = base_test(TAG, stop=False)
-    test.connect_p2p(0, 1)
-    for b in test.backends:
-        assert len(b.client.call("getpeerinfo")) == 1
-        assert_block_count(b, COINBASE_MATURITY + 1)
+def test_001_init_network(core, coordinator):
+    connect_p2p(core, coordinator.backend)
+    assert core.client.get_connection_count() == 1
+    assert coordinator.backend.client.get_connection_count() == 1
+    assert_block_count(core, 0)
+    assert_block_count(coordinator.backend, 0)
 
 
-def test_003_create_watchonly_wallet(base_test):
-    test = base_test(TAG, stop=False)
-    rpc_krux = test.backends[1].client.call
-    test.create_watchonly_wallet(test.backends[1], WALLET, test.signers[0][1])
-    assert WALLET in rpc_krux("listwallets")
-    info = rpc_krux("getwalletinfo")
-    test.log.info(LOG.format("test_003_create_watchonly_wallet", info))
-    assert info["walletname"] == WALLET
+def test_002_create_wallets(core, coordinator):
+    create_wallet(core)
+    assert_wallet_info(core, "bornal-wallet")
+    assert core.client.get_balance() == 0
+
+    # both airgap wallets were imported by ``BaseTest.run_test``
+    assert coordinator.wallets == [ALICE, BOB]
+    assert sorted(coordinator.backend.client.list_wallets()) == [ALICE, BOB]
+
+
+def test_003_check_wallet_core(coordinator):
+    alice = coordinator.get_wallet(ALICE)
+    assert_wallet_info(alice.backend, ALICE, watchonly=True)
+    info = alice.backend.client.get_wallet_info()
     assert info["descriptors"] is True
     assert info["private_keys_enabled"] is False
-    assert rpc_krux("getbalance") == 0
+    assert alice.backend.client.get_balance() == 0
 
 
-def test_004_receive_address_first(base_test):
-    test = base_test(TAG, stop=False)
-    core_addr = test.backends[1].client.call("getnewaddress", "", "legacy")
-    krux_addr = next(test.signers[0][0].obtain_addresses())
-    test.log.info(
-        LOG.format("test_004_receive_address", {"core": core_addr, "krux": krux_addr})
-    )
-    assert core_addr == krux_addr
+def test_004_check_bob(coordinator):
+    bob = coordinator.get_wallet(BOB)
+    assert_wallet_info(bob.backend, BOB, watchonly=True)
+    info = bob.backend.client.get_wallet_info()
+    assert info["descriptors"] is True
+    assert info["private_keys_enabled"] is False
+    assert bob.backend.client.get_balance() == 0
 
 
-def test_005_change_addresses(base_test):
-    test = base_test(TAG, stop=False)
-    rpc_krux = test.backends[1].client.call
-    signer = test.signers[0][0]
+def test_005_mine(core, coordinator):
+    address = get_new_address(core, "coinbase", "legacy")
+    generate_to_address(core, address, COINBASE_MATURITY + 1)
+    sync_blocks(core, coordinator.backend)
 
-    (internal,) = [
-        d for d in rpc_krux("listdescriptors")["descriptors"] if d["internal"]
-    ]
-    test.log.info(LOG.format("test_005_change_address", internal))
-    assert internal["active"] is True
-    assert internal["next"] == 0
-
-    core_addrs = rpc_krux("deriveaddresses", internal["desc"], [0, 9])
-    krux_addrs = [next(signer.obtain_addresses(i=i, branch_index=1)) for i in range(10)]
-    test.log.info(
-        LOG.format("test_005_change_address", {"core": core_addrs, "krux": krux_addrs})
-    )
-    assert core_addrs == krux_addrs
-
-    for i, addr in enumerate(krux_addrs):
-        info = rpc_krux("getaddressinfo", addr)
-        assert info["ismine"] is True
-        assert info["ischange"] is True
-        assert info["hdkeypath"].replace("'", "h") == signer.key.derivation + f"/1/{i}"
+    assert_block_count(core, COINBASE_MATURITY + 1)
+    assert_block_count(coordinator.backend, COINBASE_MATURITY + 1)
+    assert core.client.get_balance() >= BASE_COINBASE_SUBSIDY
+    for name in coordinator.wallets:
+        assert coordinator.get_wallet(name).backend.client.get_balance() == 0
 
 
-def test_006_send_to_watchonly(base_test):
-    test = base_test(TAG, stop=False)
-    rpc_core = test.backends[0].client.call
-    rpc_krux = test.backends[1].client.call
-
-    addr = rpc_krux("getnewaddress", "", "legacy")
-    assert addr == next(test.signers[0][0].obtain_addresses(i=1))
-
-    txid = rpc_core("sendtoaddress", addr, FUNDING)
-    test.log.info(
-        LOG.format(
-            "test_006_send_to_watchonly",
-            {"funding": FUNDING, "addr": addr, "txid": txid},
+def test_006_receive_address_first(coordinator, signer):
+    for name in coordinator.wallets:
+        core_addr = coordinator.get_wallet(name).backend.client.get_new_address(
+            "", "legacy"
         )
-    )
-    assert txid in rpc_core("getrawmempool")
-    assert rpc_krux("getbalance") == 0
-
-    test.state["address"] = addr
-    test.state["txid"] = txid
+        krux_addr = next(signer(name).wallet.obtain_addresses())
+        assert core_addr == krux_addr
 
 
-def test_007_confirm(base_test):
-    test = base_test(TAG, stop=False)
-    rpc_core = test.backends[0].client.call
-    rpc_krux = test.backends[1].client.call
+def test_007_change_addresses(coordinator, signer):
+    for name in coordinator.wallets:
+        wallet = coordinator.get_wallet(name)
+        airgap = signer(name)
+        (internal,) = [
+            d
+            for d in wallet.backend.client.call("listdescriptors")["descriptors"]
+            if d["internal"]
+        ]
+        assert internal["active"] is True
+        assert internal["next"] == 0
 
-    generate_to_address(test.backends[0], 1)
-    test.sync_blocks(0, 1)
-    for b in test.backends:
-        assert_block_count(b, COINBASE_MATURITY + 2)
-    assert rpc_core("getrawmempool") == []
-    assert rpc_krux("gettransaction", test.state["txid"])["confirmations"] == 1
+        core_addrs = wallet.backend.client.call(
+            "deriveaddresses", internal["desc"], [0, 9]
+        )
+        krux_addrs = [
+            next(airgap.wallet.obtain_addresses(i=i, branch_index=1)) for i in range(10)
+        ]
+        assert core_addrs == krux_addrs
+
+        derivation = airgap.wallet.key.derivation
+        for i, addr in enumerate(krux_addrs):
+            info = wallet.backend.client.get_address_info(addr)
+            assert info["ismine"] is True
+            assert info["ischange"] is True
+            assert info["hdkeypath"].replace("'", "h") == derivation + f"/1/{i}"
 
 
-def test_008_balance(base_test):
-    test = base_test(TAG, stop=False)
-    rpc_krux = test.backends[1].client.call
-    addr, txid = test.state["address"], test.state["txid"]
+def test_008_send_to_alice(core, coordinator, signer, state):
+    alice = coordinator.get_wallet(ALICE)
+    addr = alice.backend.client.get_new_address("", "legacy")
+    assert addr == next(signer("alice").wallet.obtain_addresses(i=1))
 
-    assert rpc_krux("getbalance") == FUNDING
-    assert rpc_krux("getreceivedbyaddress", addr) == FUNDING
-    unspent = rpc_krux("listunspent")
-    test.log.info(LOG.format("test_008_balance", unspent))
+    txid = core.client.call("sendtoaddress", addr, FUNDING)
+    assert txid in core.client.get_raw_mempool()
+    assert alice.backend.client.get_balance() == 0
+
+    state["address"] = addr
+    state["txid"] = txid
+
+
+def test_009_confirm(core, coordinator, state):
+    generate_to_address(core, UNSPENDABLE_ADDRESS, 1)
+    sync_blocks(core, coordinator.backend)
+    assert_block_count(core, COINBASE_MATURITY + 2)
+    assert_block_count(coordinator.backend, COINBASE_MATURITY + 2)
+    assert core.client.get_raw_mempool() == []
+
+    alice = coordinator.get_wallet(ALICE)
+    assert alice.backend.client.get_transaction(state["txid"])["confirmations"] == 1
+    assert coordinator.get_wallet(BOB).backend.client.get_balance() == 0
+
+
+def test_010_balance(coordinator, state):
+    alice = coordinator.get_wallet(ALICE)
+    addr, txid = state["address"], state["txid"]
+
+    assert alice.backend.client.get_balance() == FUNDING
+    assert alice.backend.client.call("getreceivedbyaddress", addr) == FUNDING
+    unspent = alice.backend.client.list_unspent()
     assert [
         (u["txid"], u["address"], u["amount"], u["confirmations"]) for u in unspent
     ] == [(txid, addr, FUNDING, 1)]
 
 
-def test_009_create_unsigned_psbt(base_test):
-    test = base_test(TAG, stop=False)
-    rpc_krux = test.backends[1].client.call
-
-    res = rpc_krux(
-        "walletcreatefundedpsbt",
+def test_011_create_unsigned_psbt(coordinator, state):
+    alice = coordinator.get_wallet(ALICE)
+    res = alice.backend.client.wallet_create_funded_psbt(
         [],
         [{UNSPENDABLE_ADDRESS: PAYMENT}],
         0,
         {"change_type": "legacy", "fee_rate": 1},
     )
-    test.log.info(LOG.format("test_009_create_unsigned_psbt", res))
     assert 0 < res["fee"] < 0.0001
     assert res["changepos"] != -1
 
-    test.state["psbt"] = res["psbt"]
-    test.state["changepos"] = res["changepos"]
-    test.state["fee"] = res["fee"]
+    state["psbt"] = res["psbt"]
+    state["changepos"] = res["changepos"]
+    state["fee"] = res["fee"]
 
 
-def test_010_psbt_spends_utxo(base_test):
-    test = base_test(TAG, stop=False)
-    rpc_krux = test.backends[1].client.call
-    decoded = rpc_krux("decodepsbt", test.state["psbt"])
+def test_012_psbt_spends_utxo(coordinator, state):
+    decoded = coordinator.backend.client.decode_psbt(state["psbt"])
 
-    (utxo,) = rpc_krux("listunspent")
+    (utxo,) = coordinator.get_wallet(ALICE).backend.client.list_unspent()
     (vin,) = decoded["tx"]["vin"]
     assert (vin["txid"], vin["vout"]) == (utxo["txid"], utxo["vout"])
 
     (inp,) = decoded["inputs"]
     prevout = inp["non_witness_utxo"]["vout"][utxo["vout"]]
-    assert inp["non_witness_utxo"]["txid"] == test.state["txid"]
+    assert inp["non_witness_utxo"]["txid"] == state["txid"]
     assert prevout["value"] == FUNDING
-    assert prevout["scriptPubKey"]["address"] == test.state["address"]
+    assert prevout["scriptPubKey"]["address"] == state["address"]
 
 
-def test_011_psbt_change_address(base_test):
-    test = base_test(TAG, stop=False)
-    rpc_krux = test.backends[1].client.call
-    signer = test.signers[0][0]
-    decoded = rpc_krux("decodepsbt", test.state["psbt"])
+def test_013_psbt_change_address(coordinator, signer, state):
+    alice = signer("alice")
+    decoded = coordinator.backend.client.decode_psbt(state["psbt"])
 
-    changepos = test.state["changepos"]
+    changepos = state["changepos"]
     core_change = decoded["tx"]["vout"][changepos]["scriptPubKey"]["address"]
-    krux_change = next(signer.obtain_addresses(branch_index=1))
-    test.log.info(LOG.format("test_011_psbt_change_address", core_change))
+    krux_change = next(alice.wallet.obtain_addresses(branch_index=1))
     assert core_change == krux_change
 
-    info = rpc_krux("getaddressinfo", core_change)
+    info = coordinator.get_wallet(ALICE).backend.client.get_address_info(core_change)
     hdkeypath = info["hdkeypath"].replace("'", "h")
     assert info["ismine"] is True
     assert info["ischange"] is True
-    assert hdkeypath == signer.key.derivation + "/1/0"
+    assert hdkeypath == alice.wallet.key.derivation + "/1/0"
 
-    test.state["change"] = core_change
+    state["change"] = core_change
 
 
-def test_012_psbt_outputs(base_test):
-    test = base_test(TAG, stop=False)
-    rpc_krux = test.backends[1].client.call
-    decoded = rpc_krux("decodepsbt", test.state["psbt"])
+def test_014_psbt_outputs(coordinator, state):
+    decoded = coordinator.backend.client.decode_psbt(state["psbt"])
 
     outs = {o["scriptPubKey"]["address"]: o["value"] for o in decoded["tx"]["vout"]}
-    test.log.info(LOG.format("test_012_psbt_outputs", outs))
-    assert set(outs) == {UNSPENDABLE_ADDRESS, test.state["change"]}
+    assert set(outs) == {UNSPENDABLE_ADDRESS, state["change"]}
     assert outs[UNSPENDABLE_ADDRESS] == PAYMENT
-    assert round(sum(outs.values()) + test.state["fee"], 8) == FUNDING
+    assert round(sum(outs.values()) + state["fee"], 8) == FUNDING
 
 
-def test_013_psbt_input_derivation(base_test, getpubkey):
-    test = base_test(TAG, stop=False)
-    rpc_krux = test.backends[1].client.call
-    signer = test.signers[0][0]
-    decoded = rpc_krux("decodepsbt", test.state["psbt"])
+def test_015_psbt_input_derivation(coordinator, signer, state):
+    alice = signer("alice")
+    key = alice.wallet.key
+    decoded = coordinator.backend.client.decode_psbt(state["psbt"])
 
     (inp,) = decoded["inputs"]
     (deriv,) = inp["bip32_derivs"]
-    test.log.info(LOG.format("test_013_psbt_input_derivation", deriv))
-    assert deriv["pubkey"] == getpubkey(signer, 0, 1).hex()
-    assert deriv["master_fingerprint"] == signer.key.fingerprint_hex_str()
-    assert deriv["path"].replace("'", "h") == signer.key.derivation + "/0/1"
+    assert deriv["pubkey"] == alice.get_pubkey(0, 1).hex()
+    assert deriv["master_fingerprint"] == key.fingerprint_hex_str()
+    assert deriv["path"].replace("'", "h") == key.derivation + "/0/1"
 
 
-def test_014_psbt_unsigned(base_test, getpubkey, assert_unbroadcastable):
-    test = base_test(TAG, stop=False)
-    rpc_krux = test.backends[1].client.call
-    signer = test.signers[0][0]
-    psbt = test.state["psbt"]
+def test_016_psbt_unsigned(coordinator, signer, state):
+    alice = signer("alice")
+    psbt = state["psbt"]
 
-    (inp,) = rpc_krux("decodepsbt", psbt)["inputs"]
+    (inp,) = coordinator.backend.client.decode_psbt(psbt)["inputs"]
     assert "partial_signatures" not in inp
     assert "final_scriptSig" not in inp
 
-    pkh = hash160(getpubkey(signer, 0, 1)).hex()
-    analysis = rpc_krux("analyzepsbt", psbt)
-    test.log.info(LOG.format("test_014_psbt_unsigned", analysis))
+    pkh = hash160(alice.get_pubkey(0, 1)).hex()
+    analysis = coordinator.backend.client.analyze_psbt(psbt)
     assert analysis["next"] == "signer"
     for inp_analysis in analysis["inputs"]:
         assert inp_analysis["has_utxo"]
         assert not inp_analysis["is_final"]
         assert inp_analysis["next"] == "signer"
         assert inp_analysis["missing"] == {"signatures": [pkh]}
-    assert_unbroadcastable(test.backends[1], psbt)
-    test.log.info(
-        LOG.format(
-            "test_014_psbt_unsigned", {"message": "Not broadcastable", "psbt": psbt}
-        )
-    )
+
+    assert_not_finalized(coordinator.backend, psbt)
+    assert_next_role(coordinator.backend, psbt, "signer")
+    assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(psbt))
 
 
-def test_015_psbt_wrong_signer(base_test, psbtcopy, psbtsigner, assert_unbroadcastable):
-    test = base_test(TAG, stop=False)
-    wrong_signer = test.signers[1][0]
-    copied = psbtcopy(test.state["psbt"])
-    signer_krux = psbtsigner(wrong_signer, copied)
-    test.log.info(LOG.format("test_015_psbt_wrong_signer", signer_krux))
+def test_017_psbt_wrong_signer(coordinator, signer, state):
+    signer_krux = signer("bob").as_signer(state["psbt"])
 
     assert signer_krux.path_mismatch() == ""
     with raises(ValueError, match="cannot sign"):
         signer_krux.sign()
 
     unsigned = signer_krux.psbt.to_string()
-    assert_unbroadcastable(test.backends[1], unsigned)
-    test.log.info(
-        LOG.format(
-            "test_015_psbt_wrong_signer",
-            {"message": "Not broadcastable", "psbt": unsigned},
-        )
+    assert_not_finalized(coordinator.backend, unsigned)
+    assert_next_role(coordinator.backend, unsigned, "signer")
+    assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(unsigned))
+
+
+def test_018_psbt_invalid(coordinator, signer):
+    rawtx = coordinator.backend.client.create_raw_transaction(
+        [], [{UNSPENDABLE_ADDRESS: 1}]
     )
 
-
-def test_016_psbt_invalid(base_test, psbtsigner):
-    test = base_test(TAG, stop=False)
-    rpc_krux = test.backends[1].client.call
-    wrong_signer = test.signers[0][0]
-    rawtx = rpc_krux("createrawtransaction", [], [{UNSPENDABLE_ADDRESS: 1}])
-
-    test.log.info(LOG.format("test_016_psbt_invalid", rawtx))
     with raises(ValueError, match="invalid PSBT"):
-        psbtsigner(wrong_signer, rawtx)
+        signer("alice").as_signer(rawtx)
 
     with raises(ClientError, match="TX decode failed"):
-        rpc_krux("finalizepsbt", rawtx)
+        coordinator.backend.client.finalize_psbt(rawtx)
 
 
-def test_017_psbt_mismatch(
-    base_test, airgap_wallet, psbtcopy, psbtsigner, assert_unbroadcastable
-):
-    test = base_test(TAG, stop=False)
-    signer = test.signers[0][0]
-    assert psbtsigner(signer, test.state["psbt"]).path_mismatch() == ""
+def test_019_psbt_mismatch(coordinator, signer, state):
+    alice = signer("alice")
+    psbt = state["psbt"]
+    assert alice.as_signer(psbt).path_mismatch() == ""
 
     for net, purpose in MISMATCHED:
-        tmpwallet = airgap_wallet(signer.key.mnemonic, TYPE_SINGLESIG, net, purpose)
-        tmpsigner = psbtsigner(tmpwallet, psbtcopy(test.state["psbt"]))
-        test.log.info(LOG.format("test_017_psbt_mismatch", tmpwallet.key.derivation))
+        tmpsigner = alice.as_variant(TYPE_SINGLESIG, net, purpose).as_signer(psbt)
         assert tmpsigner.path_mismatch() == "m/44h/1h/0h"
 
         # Mimic the behaviour where a user declines "Proceed?" on the warning,
         # so Krux signs nothing, and user try to broadcast eitherway
         # the mismatch is a UX warning from core
         unsigned = tmpsigner.psbt.to_string()
-        assert_unbroadcastable(test.backends[1], unsigned)
-        test.log.info(
-            LOG.format(
-                "test_017_psbt_mismatch",
-                {"message": "Not broadcastable", "psbt": unsigned},
-            )
-        )
+        assert_not_finalized(coordinator.backend, unsigned)
+        assert_next_role(coordinator.backend, unsigned, "signer")
+        assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(unsigned))
 
 
-def test_018_psbt_wrong_policy(
-    base_test, airgap_wallet, psbtsigner, assert_unbroadcastable
-):
-    test = base_test(TAG, stop=False)
-    signer = test.signers[0][0]
+def test_020_psbt_wrong_policy(coordinator, signer, state):
+    alice = signer("alice")
+    psbt = state["psbt"]
     cases = [
         (TYPE_MULTISIG, P2SH, "Not a multisig PSBT"),
         (TYPE_MULTISIG, P2SH_P2WSH, "Not a multisig PSBT"),
@@ -432,36 +388,24 @@ def test_018_psbt_wrong_policy(
     ]
 
     for policy, purpose, err in cases:
-        tmpwallet = airgap_wallet(
-            signer.key.mnemonic, policy, NETWORKS["regtest"], purpose
-        )
-        test.log.info(
-            LOG.format("test_018_psbt_wrong_policy", tmpwallet.key.derivation)
-        )
-
+        variant = alice.as_variant(policy, NETWORKS["regtest"], purpose)
         with raises(ValueError, match=f"Invalid PSBT: {err}"):
-            psbtsigner(tmpwallet, test.state["psbt"])
+            variant.as_signer(psbt)
 
-    assert_unbroadcastable(test.backends[1], test.state["psbt"])
-    test.log.info(
-        LOG.format(
-            "test_018_psbt_wrong_policy",
-            {"message": "Not broadcastable", "psbt": test.state["psbt"]},
-        )
-    )
+    assert_not_finalized(coordinator.backend, psbt)
+    assert_next_role(coordinator.backend, psbt, "signer")
+    assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(psbt))
 
 
-def test_019_psbt_mismatch_sign(
-    base_test, airgap_wallet, psbtcopy, psbtsigner, assert_finalizable
-):
+def test_021_psbt_mismatch_sign(coordinator, signer, state):
     # A path mismatch is a UX warning only. Krux signs and the same seed produces
     # a valid signature that Core accepts.
-    test = base_test(TAG, stop=False)
-    signer = test.signers[0][0]
+    alice = signer("alice")
 
     for net, purpose in MISMATCHED:
-        tmpwallet = airgap_wallet(signer.key.mnemonic, TYPE_SINGLESIG, net, purpose)
-        tmpsigner = psbtsigner(tmpwallet, psbtcopy(test.state["psbt"]))
+        tmpsigner = alice.as_variant(TYPE_SINGLESIG, net, purpose).as_signer(
+            state["psbt"]
+        )
         assert tmpsigner.path_mismatch() == "m/44h/1h/0h"
 
         # Mimic the user tapping "Proceed?" on the warning at a krux device
@@ -472,77 +416,59 @@ def test_019_psbt_mismatch_sign(
         # It isn't recommended to do `sendrawtransaction` as pedagogical approach;
         # instead, we call `finalizepsbt` and `testmempoolaccept` as a dry
         # run and never broadcast.
-        finalized = assert_finalizable(test.backends[1], signed)
-        test.log.info(
-            LOG.format(
-                "test_019_psbt_mismatch_still_signs",
-                {"derivation": tmpwallet.key.derivation, "finalized": finalized},
-            )
-        )
+        hextx = assert_finalized(coordinator.backend, signed)
+        assert_mempool_accepts(coordinator.backend, hextx)
 
 
-def test_020_psbt_rejects_without_prev_tx(
-    base_test, psbtcopy, psbtsigner, assert_unbroadcastable
-):
-    # pylint: disable=too-many-locals
-    test = base_test(TAG, stop=False)
-    backend = test.backends[1]
-    rpc_krux = backend.client.call
-    signer = test.signers[0][0]
+def test_022_psbt_rejects_without_prev_tx(coordinator, signer, state):
+    alice = signer("alice")
+    alice_wallet = coordinator.get_wallet(ALICE)
     err = "Invalid PSBT: missing non_witness_utxo on a legacy input"
 
     # 1) coordinator attaches no UTXO data at all
-    (utxo,) = rpc_krux("listunspent")
-    barepsbt = rpc_krux(
-        "createpsbt",
+    (utxo,) = alice_wallet.backend.client.list_unspent()
+    barepsbt = alice_wallet.backend.client.create_psbt(
         [{"txid": utxo["txid"], "vout": utxo["vout"]}],
         [{UNSPENDABLE_ADDRESS: PAYMENT}],
     )
-    test.log.info(LOG.format("test_020_psbt_rejects_without_prev_tx", barepsbt))
     with raises(ValueError, match=err):
-        psbtsigner(signer, barepsbt)
+        alice.as_signer(barepsbt)
 
-    (analysis,) = rpc_krux("analyzepsbt", barepsbt)["inputs"]
+    (analysis,) = coordinator.backend.client.analyze_psbt(barepsbt)["inputs"]
     assert not analysis["has_utxo"]
-    assert_unbroadcastable(backend, barepsbt, role="updater")
+    assert_not_finalized(coordinator.backend, barepsbt)
+    assert_next_role(coordinator.backend, barepsbt, "updater")
+    assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(barepsbt))
 
     # 2) only coordinator could repair the psbt
-    updated = rpc_krux("utxoupdatepsbt", barepsbt)
-    (inp,) = rpc_krux("decodepsbt", updated)["inputs"]
+    updated = coordinator.backend.client.call("utxoupdatepsbt", barepsbt)
+    (inp,) = coordinator.backend.client.decode_psbt(updated)["inputs"]
     assert "non_witness_utxo" not in inp
 
-    repaired = rpc_krux("walletprocesspsbt", updated, False)
-    (inp,) = rpc_krux("decodepsbt", repaired["psbt"])["inputs"]
+    repaired = alice_wallet.backend.client.wallet_process_psbt(updated, False)
+    (inp,) = coordinator.backend.client.decode_psbt(repaired["psbt"])["inputs"]
     assert not repaired["complete"]
     assert "non_witness_utxo" in inp
-    assert psbtsigner(signer, repaired["psbt"]).path_mismatch() == ""
+    assert alice.as_signer(repaired["psbt"]).path_mismatch() == ""
 
     # 3) amount through witness_utxo instead of proving it with the previous tx
     # and krux will refuse and core will wanna updated psbt
-    copied = psbtcopy(test.state["psbt"])
+    copied = PSBT.from_string(state["psbt"])
     (inp,) = copied.inputs
     inp.witness_utxo = inp.non_witness_utxo.vout[inp.vout]
     inp.non_witness_utxo = None
     with raises(ValueError, match=err):
-        psbtsigner(signer, copied)
+        alice.as_signer(copied)
     declared = copied.to_string()
-    analysis = rpc_krux("analyzepsbt", declared)
-    test.log.info(LOG.format("test_020_psbt_rejects_without_prev_tx", analysis))
+    analysis = coordinator.backend.client.analyze_psbt(declared)
     assert analysis["inputs"][0]["has_utxo"]
-    assert analysis["fee"] == test.state["fee"]
-    assert_unbroadcastable(backend, declared, role="updater")
-    test.log.info(
-        LOG.format(
-            "test_020_psbt_rejects_without_prev_tx",
-            {
-                "message": "Not broadcastable",
-                "psbt": {"raw": declared, "analysis": analysis},
-            },
-        )
-    )
+    assert analysis["fee"] == state["fee"]
+    assert_not_finalized(coordinator.backend, declared)
+    assert_next_role(coordinator.backend, declared, "updater")
+    assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(declared))
 
 
-def test_021_psbt_malicious_prev_tx(base_test, psbtcopy, psbtsigner):
+def test_023_psbt_malicious_prev_tx(coordinator, signer, state):
     # supose that coordinator lies in the previous tx
     # (name, real val, malicious coordinator val)
     # this could happen:
@@ -551,46 +477,27 @@ def test_021_psbt_malicious_prev_tx(base_test, psbtcopy, psbtsigner):
     # | spent               | 1.5        | 1.00000235               |
     # | outputs             | 1.0        | 1.0                      |
     # | fee on krux display | 0.5        | 0.00000235               |
-    test = base_test(TAG, stop=False)
-    signer = test.signers[0][0]
-    rpc_krux = test.backends[1].client.call
 
     # an attacker could consider that the signature is still valid on krux
     # (sighash never included amount). If faked, the aim is to half coins go to
     # miner and the device show nothing. Krux will refuse to even start the
     # signature procedure.
-    copied = psbtcopy(test.state["psbt"])
+    copied = PSBT.from_string(state["psbt"])
     fake_prev = Transaction.parse(copied.inputs[0].non_witness_utxo.serialize())
     fake_prev.vout[copied.inputs[0].vout].value //= 2
     copied.inputs[0].non_witness_utxo = fake_prev
     with raises(ValueError, match="Invalid PSBT: Previous txid doesn't match"):
-        psbtsigner(signer, copied)
+        signer("alice").as_signer(copied)
 
     # Core refuses to parse too
-    declared = copied.to_string()
     with raises(ClientError, match="Non-witness UTXO does not match outpoint hash"):
-        rpc_krux("decodepsbt", declared)
-
-    test.log.info(
-        LOG.format(
-            "test_021_psbt_malicious_prev_tx",
-            {"message": "Not broadcastable", "psbt": declared},
-        )
-    )
+        coordinator.backend.client.decode_psbt(copied.to_string())
 
 
-def test_022_psbt_outputs_exceeds_inputs(
-    base_test, psbtcopy, psbtsigner, assert_unbroadcastable
-):
-    test = base_test(TAG, stop=False)
-    signer = test.signers[0][0]
-    backend = test.backends[1]
-    rpc_krux = backend.client.call
-
+def test_024_psbt_outputs_exceeds_inputs(coordinator, signer, state):
     # Try to spend more than what is capable
     with raises(ClientError, match="Insufficient funds"):
-        rpc_krux(
-            "walletcreatefundedpsbt",
+        coordinator.get_wallet(ALICE).backend.client.wallet_create_funded_psbt(
             [],
             [{UNSPENDABLE_ADDRESS: FUNDING + PAYMENT}],
             0,
@@ -599,61 +506,43 @@ def test_022_psbt_outputs_exceeds_inputs(
 
     # modify the payment
     # krux should be able to refuse to even create signer
-    copied = psbtcopy(test.state["psbt"])
-    copied.outputs[1 - test.state["changepos"]].value = copied.inputs[0].utxo.value + 1
+    copied = PSBT.from_string(state["psbt"])
+    copied.outputs[1 - state["changepos"]].value = copied.inputs[0].utxo.value + 1
     with raises(ValueError, match="Invalid PSBT: outputs exceed inputs"):
-        psbtsigner(signer, copied)
+        signer("alice").as_signer(copied)
 
     # Core also check the negative fee applied and will ask for signer to check again
     modified = copied.to_string()
-    analysis = rpc_krux("analyzepsbt", modified)
-    test.log.info(LOG.format("test_022_psbt_outputs_exceeds_inputs", analysis))
-    assert analysis["fee"] < 0
-    assert_unbroadcastable(backend, modified, rejectreason="bad-txns-in-belowout")
-    test.log.info(
-        LOG.format(
-            "test_022_psbt_outputs_exceeds_inputs",
-            {"message": "Not broadcastable", "psbt": modified},
-        )
+    assert coordinator.backend.client.analyze_psbt(modified)["fee"] < 0
+    assert_not_finalized(coordinator.backend, modified)
+    assert_next_role(coordinator.backend, modified, "signer")
+    assert_send_rawtx_rejects(
+        coordinator.backend, unsigned_hex(modified), "bad-txns-in-belowout"
     )
 
 
-def test_023_psbt_sighash(base_test, psbtsigner, assert_unbroadcastable):
+def test_025_psbt_sighash(coordinator, signer, state):
     # similar to mitm above, change the sighash
-    test = base_test(TAG, stop=True)
-    backend = test.backends[1]
-    rpc_krux = backend.client.call
-    signer = test.signers[0][0]
+    alice = signer("alice")
+    alice_wallet = coordinator.get_wallet(ALICE)
     cases = [("NONE", "0x02"), ("SINGLE", "0x03"), ("ALL|ANYONECANPAY", "0x81")]
 
     # for each sighash, check in both krux and core the signs of malicious psbt
-    for i, (sighash, _hex) in enumerate(cases):
-        test.log.info(
-            LOG.format(
-                "test_023_psbt_sighash",
-                {"case": i, "sighash": {"key": sighash, "value": _hex}},
-            )
+    for sighash, _hex in cases:
+        req = alice_wallet.backend.client.wallet_process_psbt(
+            state["psbt"], False, sighash
         )
-        req = rpc_krux("walletprocesspsbt", test.state["psbt"], False, sighash)
-        (inputs,) = rpc_krux("decodepsbt", req["psbt"])["inputs"]
-        test.log.info(
-            LOG.format("test_023_psbt_sighash", {"psbt": req, "inputs": inputs})
-        )
+        (inputs,) = coordinator.backend.client.decode_psbt(req["psbt"])["inputs"]
         assert not req["complete"]
         assert inputs["sighash"] == sighash
 
         # Krux will able to create the signer, but will refuse to sign
-        _krux = psbtsigner(signer, req["psbt"])
-        test.log.info(LOG.format("test_023_psbt_sighash", sighash))
+        _krux = alice.as_signer(req["psbt"])
         with raises(ValueError, match=f"Input 0 has non-standard sighash type: {_hex}"):
             _krux.sign()
 
         # Core does not see it as signer's work done yet
         unsigned = _krux.psbt.to_string()
-        assert_unbroadcastable(backend, unsigned, role="updater")
-        test.log.info(
-            LOG.format(
-                "test_023_psbt_sighash",
-                {"message": "Not broadcastable", "psbt": unsigned},
-            )
-        )
+        assert_not_finalized(coordinator.backend, unsigned)
+        assert_next_role(coordinator.backend, unsigned, "updater")
+        assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(unsigned))

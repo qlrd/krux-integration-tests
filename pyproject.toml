@@ -18,7 +18,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-bornal = { git = "https://github.com/qlrd/bornal.git" }
+bornal = { git = "https://github.com/qlrd/bornal.git", rev = "2a42745b" }
 embit = { path = "vendor/krux/vendor/embit", editable = true }
 uUR = { path = "vendor/krux/firmware/MaixPy/components/micropython/port/src/bc-ur" }
 
