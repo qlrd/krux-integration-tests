@@ -72,7 +72,6 @@ from bornal.testing import (
     assert_send_rawtx_rejects,
     assert_wallet_info,
     connect_p2p,
-    create_wallet,
     generate_to_address,
     get_new_address,
     sync_blocks,
@@ -127,17 +126,18 @@ def test_001_init_network(core, coordinator):
     assert_block_count(coordinator.backend, 0)
 
 
-def test_002_create_wallets(core, coordinator):
-    create_wallet(core)
+def test_002_hot_wallet(core):
     assert_wallet_info(core, "bornal-wallet")
     assert core.client.get_balance() == 0
 
+
+def test_003_watchonly_wallet(coordinator):
     # both airgap wallets were imported by ``BaseTest.run_test``
     assert coordinator.wallets == [ALICE, BOB]
     assert sorted(coordinator.backend.client.list_wallets()) == [ALICE, BOB]
 
 
-def test_003_check_wallet_core(coordinator):
+def test_004_check_wallet_core(coordinator):
     alice = coordinator.get_wallet(ALICE)
     assert_wallet_info(alice.backend, ALICE, watchonly=True)
     info = alice.backend.client.get_wallet_info()
@@ -146,7 +146,7 @@ def test_003_check_wallet_core(coordinator):
     assert alice.backend.client.get_balance() == 0
 
 
-def test_004_check_bob(coordinator):
+def test_005_check_bob(coordinator):
     bob = coordinator.get_wallet(BOB)
     assert_wallet_info(bob.backend, BOB, watchonly=True)
     info = bob.backend.client.get_wallet_info()
@@ -155,7 +155,7 @@ def test_004_check_bob(coordinator):
     assert bob.backend.client.get_balance() == 0
 
 
-def test_005_mine(core, coordinator):
+def test_006_mine(core, coordinator):
     address = get_new_address(core, "coinbase", "legacy")
     generate_to_address(core, address, COINBASE_MATURITY + 1)
     sync_blocks(core, coordinator.backend)
@@ -167,7 +167,7 @@ def test_005_mine(core, coordinator):
         assert coordinator.get_wallet(name).backend.client.get_balance() == 0
 
 
-def test_006_receive_address_first(coordinator, signer):
+def test_007_receive_address_first(coordinator, signer):
     for name in coordinator.wallets:
         core_addr = coordinator.get_wallet(name).backend.client.get_new_address(
             "", "legacy"
@@ -176,7 +176,7 @@ def test_006_receive_address_first(coordinator, signer):
         assert core_addr == krux_addr
 
 
-def test_007_change_addresses(coordinator, signer):
+def test_008_change_addresses(coordinator, signer):
     for name in coordinator.wallets:
         wallet = coordinator.get_wallet(name)
         airgap = signer(name)
@@ -204,7 +204,7 @@ def test_007_change_addresses(coordinator, signer):
             assert info["hdkeypath"].replace("'", "h") == derivation + f"/1/{i}"
 
 
-def test_008_send_to_alice(core, coordinator, signer, state):
+def test_009_send_to_alice(core, coordinator, signer, state):
     alice = coordinator.get_wallet(ALICE)
     addr = alice.backend.client.get_new_address("", "legacy")
     assert addr == next(signer("alice").wallet.obtain_addresses(i=1))
@@ -217,7 +217,7 @@ def test_008_send_to_alice(core, coordinator, signer, state):
     state["txid"] = txid
 
 
-def test_009_confirm(core, coordinator, state):
+def test_010_confirm(core, coordinator, state):
     generate_to_address(core, UNSPENDABLE_ADDRESS, 1)
     sync_blocks(core, coordinator.backend)
     assert_block_count(core, COINBASE_MATURITY + 2)
@@ -229,7 +229,7 @@ def test_009_confirm(core, coordinator, state):
     assert coordinator.get_wallet(BOB).backend.client.get_balance() == 0
 
 
-def test_010_balance(coordinator, state):
+def test_011_balance(coordinator, state):
     alice = coordinator.get_wallet(ALICE)
     addr, txid = state["address"], state["txid"]
 
@@ -241,7 +241,7 @@ def test_010_balance(coordinator, state):
     ] == [(txid, addr, FUNDING, 1)]
 
 
-def test_011_create_unsigned_psbt(coordinator, state):
+def test_012_create_unsigned_psbt(coordinator, state):
     alice = coordinator.get_wallet(ALICE)
     res = alice.backend.client.wallet_create_funded_psbt(
         [],
@@ -257,7 +257,7 @@ def test_011_create_unsigned_psbt(coordinator, state):
     state["fee"] = res["fee"]
 
 
-def test_012_check_spends_utxo(coordinator, state):
+def test_013_check_spends_utxo(coordinator, state):
     decoded = coordinator.backend.client.decode_psbt(state["psbt"])
 
     (utxo,) = coordinator.get_wallet(ALICE).backend.client.list_unspent()
@@ -271,7 +271,7 @@ def test_012_check_spends_utxo(coordinator, state):
     assert prevout["scriptPubKey"]["address"] == state["address"]
 
 
-def test_013_psbt_change_address(coordinator, signer, state):
+def test_014_psbt_change_address(coordinator, signer, state):
     alice = signer("alice")
     decoded = coordinator.backend.client.decode_psbt(state["psbt"])
 
@@ -289,7 +289,7 @@ def test_013_psbt_change_address(coordinator, signer, state):
     state["change"] = core_change
 
 
-def test_014_psbt_outputs(coordinator, state):
+def test_015_psbt_outputs(coordinator, state):
     decoded = coordinator.backend.client.decode_psbt(state["psbt"])
 
     outs = {o["scriptPubKey"]["address"]: o["value"] for o in decoded["tx"]["vout"]}
@@ -298,7 +298,7 @@ def test_014_psbt_outputs(coordinator, state):
     assert round(sum(outs.values()) + state["fee"], 8) == FUNDING
 
 
-def test_015_psbt_input_derivation(coordinator, signer, state):
+def test_016_psbt_input_derivation(coordinator, signer, state):
     alice = signer("alice")
     key = alice.wallet.key
     decoded = coordinator.backend.client.decode_psbt(state["psbt"])
@@ -310,7 +310,7 @@ def test_015_psbt_input_derivation(coordinator, signer, state):
     assert deriv["path"].replace("'", "h") == key.derivation + "/0/1"
 
 
-def test_016_psbt_unsigned(coordinator, signer, state):
+def test_017_psbt_unsigned(coordinator, signer, state):
     alice = signer("alice")
     psbt = state["psbt"]
 
@@ -332,7 +332,7 @@ def test_016_psbt_unsigned(coordinator, signer, state):
     assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(psbt))
 
 
-def test_017_psbt_wrong_signer(coordinator, signer, state):
+def test_018_psbt_wrong_signer(coordinator, signer, state):
     signer_krux = signer("bob").as_signer(state["psbt"])
 
     assert signer_krux.path_mismatch() == ""
@@ -345,7 +345,7 @@ def test_017_psbt_wrong_signer(coordinator, signer, state):
     assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(unsigned))
 
 
-def test_018_psbt_invalid(coordinator, signer):
+def test_019_psbt_invalid(coordinator, signer):
     rawtx = coordinator.backend.client.create_raw_transaction(
         [], [{UNSPENDABLE_ADDRESS: 1}]
     )
@@ -357,7 +357,7 @@ def test_018_psbt_invalid(coordinator, signer):
         coordinator.backend.client.finalize_psbt(rawtx)
 
 
-def test_019_psbt_mismatch(coordinator, signer, state):
+def test_020_psbt_mismatch(coordinator, signer, state):
     alice = signer("alice")
     psbt = state["psbt"]
     assert alice.as_signer(psbt).path_mismatch() == ""
@@ -375,7 +375,7 @@ def test_019_psbt_mismatch(coordinator, signer, state):
         assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(unsigned))
 
 
-def test_020_psbt_wrong_policy(coordinator, signer, state):
+def test_021_psbt_wrong_policy(coordinator, signer, state):
     alice = signer("alice")
     psbt = state["psbt"]
     cases = [
@@ -396,7 +396,7 @@ def test_020_psbt_wrong_policy(coordinator, signer, state):
     assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(psbt))
 
 
-def test_021_psbt_mismatch_sign(coordinator, signer, state):
+def test_022_psbt_mismatch_sign(coordinator, signer, state):
     # A path mismatch is a UX warning only. Krux signs and the same seed produces
     # a valid signature that Core accepts.
     alice = signer("alice")
@@ -419,7 +419,7 @@ def test_021_psbt_mismatch_sign(coordinator, signer, state):
         assert_mempool_accepts(coordinator.backend, hextx)
 
 
-def test_022_psbt_rejects_without_prev_tx(coordinator, signer, state):
+def test_023_psbt_rejects_without_prev_tx(coordinator, signer, state):
     alice = signer("alice")
     alice_wallet = coordinator.get_wallet(ALICE)
     err = "Invalid PSBT: missing non_witness_utxo on a legacy input"
@@ -467,7 +467,7 @@ def test_022_psbt_rejects_without_prev_tx(coordinator, signer, state):
     assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(declared))
 
 
-def test_023_psbt_malicious_prev_tx(coordinator, signer, state):
+def test_024_psbt_malicious_prev_tx(coordinator, signer, state):
     # supose that coordinator lies in the previous tx
     # (name, real val, malicious coordinator val)
     # this could happen:
@@ -493,7 +493,7 @@ def test_023_psbt_malicious_prev_tx(coordinator, signer, state):
         coordinator.backend.client.decode_psbt(copied.to_string())
 
 
-def test_024_psbt_outputs_exceeds_inputs(coordinator, signer, state):
+def test_025_psbt_outputs_exceeds_inputs(coordinator, signer, state):
     # Try to spend more than what is capable
     with raises(ClientError, match="Insufficient funds"):
         coordinator.get_wallet(ALICE).backend.client.wallet_create_funded_psbt(
@@ -520,7 +520,7 @@ def test_024_psbt_outputs_exceeds_inputs(coordinator, signer, state):
     )
 
 
-def test_025_psbt_sighash(coordinator, signer, state):
+def test_026_psbt_sighash(coordinator, signer, state):
     # similar to mitm above, change the sighash
     alice = signer("alice")
     alice_wallet = coordinator.get_wallet(ALICE)
@@ -547,7 +547,7 @@ def test_025_psbt_sighash(coordinator, signer, state):
         assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(unsigned))
 
 
-def test_026_psbt_sign(coordinator, signer, state):
+def test_027_psbt_sign(coordinator, signer, state):
     # Check if all well before sign
     alice_coord = coordinator.get_wallet(ALICE)
     psbt = state["psbt"]
@@ -561,7 +561,7 @@ def test_026_psbt_sign(coordinator, signer, state):
     assert alice_signer.path_mismatch() == ""
     alice_signer.sign()
 
-    # krux adds one signature from the key core asked for in test_016
+    # krux adds one signature from the key core asked for in test_017
     (inp,) = alice_signer.psbt.inputs
     assert [pub.sec() for pub in inp.partial_sigs] == [alice.get_pubkey(0, 1)]
 
@@ -577,7 +577,7 @@ def test_026_psbt_sign(coordinator, signer, state):
     state["signed"] = hextx
 
 
-def test_027_broadcast(core, coordinator, state):
+def test_028_broadcast(core, coordinator, state):
     # Once signed say to coordinator to broadcast it
     # assert_send_rawtx_accepts try to send it and check for correct values
     alice = coordinator.get_wallet(ALICE)

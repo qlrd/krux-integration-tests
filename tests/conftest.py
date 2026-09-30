@@ -158,6 +158,11 @@ class BaseTest(IntegrationTest):
 
     def run_test(self):
         """Backends are up: one watch-only wallet per signer on the second node"""
+        # first create the hot wallet
+        create_wallet(self.backends[0])
+
+        # now create a watchonly coordinator with two reference xpubs
+        # emulating what people do with Sparrow (but without sparrow here)
         names = []
         requests = []
         for name, airgap in self.signers.items():
