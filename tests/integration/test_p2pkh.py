@@ -47,10 +47,8 @@ test_p2pkh.py
           broadcastable, rejectable)
         - malformed and malicious psbt: with or without fabricated tx or
           non-standard sighashes, outputs above inputs
-    todo:
-        - krux must sign valid psbt
-        - core imports signed psbt and broadcast
-        - another core node should see krux tx
+        - krux signs the valid psbt; core finalizes and broadcasts it
+        - the ``core`` node sees the krux tx in a block
 
 Build the daemon and run this test with the bornal's ``pytest`` plugin::
 
@@ -70,6 +68,7 @@ from bornal.testing import (
     assert_mempool_accepts,
     assert_next_role,
     assert_not_finalized,
+    assert_send_rawtx_accepts,
     assert_send_rawtx_rejects,
     assert_wallet_info,
     connect_p2p,
@@ -235,7 +234,7 @@ def test_010_balance(coordinator, state):
     addr, txid = state["address"], state["txid"]
 
     assert alice.backend.client.get_balance() == FUNDING
-    assert alice.backend.client.call("getreceivedbyaddress", addr) == FUNDING
+    assert alice.backend.client.get_received_by_address(addr) == FUNDING
     unspent = alice.backend.client.list_unspent()
     assert [
         (u["txid"], u["address"], u["amount"], u["confirmations"]) for u in unspent
@@ -258,7 +257,7 @@ def test_011_create_unsigned_psbt(coordinator, state):
     state["fee"] = res["fee"]
 
 
-def test_012_psbt_spends_utxo(coordinator, state):
+def test_012_check_spends_utxo(coordinator, state):
     decoded = coordinator.backend.client.decode_psbt(state["psbt"])
 
     (utxo,) = coordinator.get_wallet(ALICE).backend.client.list_unspent()
@@ -546,3 +545,56 @@ def test_025_psbt_sighash(coordinator, signer, state):
         assert_not_finalized(coordinator.backend, unsigned)
         assert_next_role(coordinator.backend, unsigned, "updater")
         assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(unsigned))
+
+
+def test_026_psbt_sign(coordinator, signer, state):
+    # Check if all well before sign
+    alice_coord = coordinator.get_wallet(ALICE)
+    psbt = state["psbt"]
+    assert alice_coord.backend.client.analyze_psbt(psbt)["fee"] == state["fee"]
+    assert_not_finalized(alice_coord.backend, psbt)
+    assert_next_role(alice_coord.backend, psbt, "signer")
+
+    # sign it
+    alice = signer("alice")
+    alice_signer = alice.as_signer(psbt)
+    assert alice_signer.path_mismatch() == ""
+    alice_signer.sign()
+
+    # krux adds one signature from the key core asked for in test_016
+    (inp,) = alice_signer.psbt.inputs
+    assert [pub.sec() for pub in inp.partial_sigs] == [alice.get_pubkey(0, 1)]
+
+    # check if was correctly signed (core shows "finalized")
+    signed, fmt = alice_signer.psbt_qr()
+    assert fmt == FORMAT_NONE
+    assert_next_role(alice_coord.backend, signed, "finalizer")
+
+    # check signed and if is acceptable by mempool
+    hextx = assert_finalized(alice_coord.backend, signed)
+    assert_mempool_accepts(alice_coord.backend, hextx)
+
+    state["signed"] = hextx
+
+
+def test_027_broadcast(core, coordinator, state):
+    # Once signed say to coordinator to broadcast it
+    # assert_send_rawtx_accepts try to send it and check for correct values
+    alice = coordinator.get_wallet(ALICE)
+    txid = assert_send_rawtx_accepts(alice.backend, state["signed"])
+    assert alice.backend.client.get_raw_mempool() == [txid]
+    assert alice.backend.client.get_transaction(txid)["confirmations"] == 0
+
+    # Mine a little to be confirmed by regtest network
+    (blockhash,) = generate_to_address(alice.backend, UNSPENDABLE_ADDRESS, 1)
+    sync_blocks(alice.backend, core)
+    assert_block_count(core, COINBASE_MATURITY + 3)
+    assert_block_count(alice.backend, COINBASE_MATURITY + 3)
+    assert txid in core.client.call("getblock", blockhash)["tx"]
+    assert coordinator.backend.client.get_raw_mempool() == []
+
+    # Check the fees on coordinator
+    change = round(FUNDING - PAYMENT - state["fee"], 8)
+    assert alice.backend.client.get_transaction(txid)["confirmations"] == 1
+    assert alice.backend.client.get_balance() == change
+    assert alice.backend.client.get_received_by_address(state["change"]) == change

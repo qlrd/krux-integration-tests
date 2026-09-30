@@ -50,7 +50,7 @@ wheels = [
 [[package]]
 name = "bornal"
 version = "0.1.0"
-source = { git = "https://github.com/qlrd/bornal.git?rev=2a42745b#2a42745b6c1127fe91e1a6275e508605e97b62d0" }
+source = { git = "https://github.com/qlrd/bornal.git?rev=db417aae#db417aae3e3101b046ef33f2a1884ec49aa7e300" }
 dependencies = [
     { name = "pytest" },
 ]
@@ -171,7 +171,7 @@ dev = [
 [package.metadata.requires-dev]
 dev = [
     { name = "black", specifier = ">=26.5.1" },
-    { name = "bornal", git = "https://github.com/qlrd/bornal.git?rev=2a42745b" },
+    { name = "bornal", git = "https://github.com/qlrd/bornal.git?rev=db417aae" },
     { name = "embit", editable = "vendor/krux/vendor/embit" },
     { name = "poethepoet", specifier = ">=0.48.0" },
     { name = "pylint", specifier = ">=4.0.5,<5" },
