@@ -60,6 +60,7 @@ and data folders.
 uv run poe tests                          # build (or reuse) bitcoind with wallet
 uv run poe tests -B 30.2 -j 8             # pin release and run compile parallelism
 uv run poe test-base -t p2pkh             # run only tests/integration/test_p2pkh.py
+uv run poe test-base -t p2wpkh -B 31.1    # native SegWit review/sign/export round trip
 uv run poe test-base -t p2pkh -- -k psbt  # anything after `--` goes to pytest
 ```
 

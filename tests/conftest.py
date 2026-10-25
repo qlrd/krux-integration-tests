@@ -6,6 +6,7 @@ import sys
 import types
 from collections import namedtuple
 from dataclasses import dataclass
+from functools import partial
 from unittest.mock import MagicMock
 
 import pytest
@@ -139,13 +140,17 @@ class BaseTest(IntegrationTest):
     signers: dict[str, Signer]
     coordinator: Coordinator
 
+    def __init__(self, *args, script_type=P2PKH, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.script_type = script_type
+
     def set_test_params(self):
         """Declare the airgap signers and two listening ``bitcoin-core`` nodes"""
         self.state = {}
 
         # Prepare some 'airgap' wallets (regtest only)
         self.signers = {
-            name: Signer.from_mnemonic(mnemonic)
+            name: Signer.from_mnemonic(mnemonic, script=self.script_type)
             for (name, mnemonic) in TrezorVectors()._asdict().items()
         }
 
@@ -167,15 +172,21 @@ class BaseTest(IntegrationTest):
         requests = []
         for name, airgap in self.signers.items():
             names.append(name)
-            requests.append({"desc": airgap.as_legacy().get_descriptor()})
+            requests.append({"desc": airgap.get_descriptor()})
         self.coordinator = Coordinator(self.backends[1])
         self.coordinator.import_watchonly_wallets(names, requests)
 
 
+@pytest.fixture(scope="module", name="script_type")
+def default_script_type():
+    """Signer script for the module's lab; override it per module."""
+    return P2PKH
+
+
 @pytest.fixture(scope="module")
-def test_factory():
-    """``BaseTest`` for bornal's module-scoped ``integration_test``"""
-    return BaseTest
+def test_factory(script_type):
+    """``BaseTest`` for bornal's module-scoped ``integration_test``."""
+    return partial(BaseTest, script_type=script_type)
 
 
 @pytest.fixture

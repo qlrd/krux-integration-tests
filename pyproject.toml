@@ -62,7 +62,7 @@ args = [
 ]
 
 [tool.poe.tasks.tests]
-sequence = ["test-base -t p2pkh -j ${nproc} -B ${bitcoin} ${debug:+-d}"]
+sequence = ["test-base -j ${nproc} -B ${bitcoin} ${debug:+-d}"]
 args = [
     { name = "nproc", options = ["--nproc", "-j"], type = "integer", default = 8},
     { name = "bitcoin", options = ["--bitcoin", "-B"], default = "latest"},
