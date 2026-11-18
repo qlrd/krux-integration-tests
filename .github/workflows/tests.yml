@@ -44,10 +44,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        bitcoin: ${{ github.event_name == 'schedule' && fromJSON('["29.2", "30.2", "31.1"]') || fromJSON('["31.1"]') }}
-    permissions:
-      contents: read
-      issues: write
+        bitcoin: ["29.2", "30.2", "31.1"]
 
     steps:
 
@@ -112,12 +109,3 @@ jobs:
           path: ${{ env.BORNAL_TEMP_DIR }}/data/**/regtest/debug.log
           if-no-files-found: ignore
           retention-days: 7
-
-      - name: Open issue on failure
-        if: failure() && github.event_name == 'schedule'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh issue create \
-            --title "Weekly tests failed ($(date -u +%F))" \
-            --body "See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
