@@ -6,6 +6,7 @@ import sys
 import types
 from collections import namedtuple
 from dataclasses import dataclass
+from decimal import Decimal
 from functools import partial
 from unittest.mock import MagicMock
 
@@ -20,6 +21,7 @@ _board.config = {"type": "amigo", "board_info": {}, "krux": {"display": {}, "pin
 sys.modules.setdefault("board", _board)
 for _name in ("ucryptolib", "qrcode"):
     sys.modules.setdefault(_name, MagicMock())
+
 
 # pylint: disable=wrong-import-position
 from bornal.daemon import free_port
@@ -44,6 +46,9 @@ TrezorVectors = namedtuple(
         " ".join(["zoo"] * 11 + ["wrong"]),
     ],
 )
+
+
+SATOSHIS = 100_000_000
 
 
 class Coordinator(BitcoindClient):
@@ -203,5 +208,68 @@ def signer(integration_test):
 
     def _wrapper(name: str):
         return integration_test.signers[name]
+
+    return _wrapper
+
+
+# PSBT, amount and text helpers
+#
+# Below this line some fixtures that could be used without importing embit
+# or ``decimal`` again: conversions and text normalisation for assertions.
+# -------------------------------------------------------------------------
+@pytest.fixture
+def rawtx_from_psbt():
+    """hex of the transaction ``psbt`` carries, unsigned"""
+
+    def _wrapper(psbt: str) -> str:
+        return PSBT.from_string(psbt).tx.serialize().hex()
+
+    return _wrapper
+
+
+@pytest.fixture
+def to_sats():
+    """integer satoshis of a BTC amount decoded from Core"""
+
+    def _wrapper(value) -> int:
+        amount = Decimal(str(value)) * SATOSHIS
+        if not amount.is_finite():
+            raise ValueError(f"Invalid amount: {value}")
+
+        if amount != amount.to_integral_value():
+            raise ValueError(f"Not integral value: {amount}")
+        return int(amount)
+
+    return _wrapper
+
+
+@pytest.fixture
+def to_btc():
+    """BTC ``float`` for a Core RPC amount argument"""
+
+    def _wrapper(value: int) -> float:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"Expected integer satoshis: {value!r}")
+        return float(Decimal(value) / SATOSHIS)
+
+    return _wrapper
+
+
+@pytest.fixture
+def to_formatted_btc():
+    """Krux's review amount (``₿N.NNNNNNNN``) from integer sats"""
+
+    def _wrapper(value: int) -> str:
+        return f"₿{value // SATOSHIS}.{value % SATOSHIS:08d}"
+
+    return _wrapper
+
+
+@pytest.fixture
+def compact_text():
+    """drop layout whitespace, keep labels and digits"""
+
+    def _wrapper(text: str) -> str:
+        return "".join(text.split())
 
     return _wrapper

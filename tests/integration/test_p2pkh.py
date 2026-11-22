@@ -95,8 +95,6 @@ from krux.key import (
     TYPE_MINISCRIPT,
 )
 
-from integration.helpers import unsigned_hex
-
 ALICE = "alice"
 BOB = "bob"
 FUNDING = 1.5
@@ -313,7 +311,7 @@ def test_016_psbt_input_derivation(coordinator, signer, state):
     assert deriv["path"].replace("'", "h") == key.derivation + "/0/1"
 
 
-def test_017_psbt_unsigned(coordinator, signer, state):
+def test_017_psbt_unsigned(coordinator, signer, state, rawtx_from_psbt):
     alice = signer("alice")
     psbt = state["psbt"]
 
@@ -332,10 +330,10 @@ def test_017_psbt_unsigned(coordinator, signer, state):
 
     assert_not_finalized(coordinator.backend, psbt)
     assert_next_role(coordinator.backend, psbt, "signer")
-    assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(psbt))
+    assert_send_rawtx_rejects(coordinator.backend, rawtx_from_psbt(psbt))
 
 
-def test_018_psbt_wrong_signer(coordinator, signer, state):
+def test_018_psbt_wrong_signer(coordinator, signer, state, rawtx_from_psbt):
     signer_krux = signer("bob").as_signer(state["psbt"])
 
     assert signer_krux.path_mismatch() == ""
@@ -345,7 +343,7 @@ def test_018_psbt_wrong_signer(coordinator, signer, state):
     unsigned = signer_krux.psbt.to_string()
     assert_not_finalized(coordinator.backend, unsigned)
     assert_next_role(coordinator.backend, unsigned, "signer")
-    assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(unsigned))
+    assert_send_rawtx_rejects(coordinator.backend, rawtx_from_psbt(unsigned))
 
 
 def test_019_psbt_invalid(coordinator, signer):
@@ -360,7 +358,7 @@ def test_019_psbt_invalid(coordinator, signer):
         coordinator.backend.client.finalize_psbt(rawtx)
 
 
-def test_020_psbt_mismatch(coordinator, signer, state):
+def test_020_psbt_mismatch(coordinator, signer, state, rawtx_from_psbt):
     alice = signer("alice")
     psbt = state["psbt"]
     assert alice.as_signer(psbt).path_mismatch() == ""
@@ -375,10 +373,10 @@ def test_020_psbt_mismatch(coordinator, signer, state):
         unsigned = tmpsigner.psbt.to_string()
         assert_not_finalized(coordinator.backend, unsigned)
         assert_next_role(coordinator.backend, unsigned, "signer")
-        assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(unsigned))
+        assert_send_rawtx_rejects(coordinator.backend, rawtx_from_psbt(unsigned))
 
 
-def test_021_psbt_wrong_policy(coordinator, signer, state):
+def test_021_psbt_wrong_policy(coordinator, signer, state, rawtx_from_psbt):
     alice = signer("alice")
     psbt = state["psbt"]
     cases = [
@@ -396,7 +394,7 @@ def test_021_psbt_wrong_policy(coordinator, signer, state):
 
     assert_not_finalized(coordinator.backend, psbt)
     assert_next_role(coordinator.backend, psbt, "signer")
-    assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(psbt))
+    assert_send_rawtx_rejects(coordinator.backend, rawtx_from_psbt(psbt))
 
 
 def test_022_psbt_mismatch_sign(coordinator, signer, state):
@@ -422,7 +420,7 @@ def test_022_psbt_mismatch_sign(coordinator, signer, state):
         assert_mempool_accepts(coordinator.backend, hextx)
 
 
-def test_023_psbt_rejects_without_prev_tx(coordinator, signer, state):
+def test_023_psbt_rejects_without_prev_tx(coordinator, signer, state, rawtx_from_psbt):
     alice = signer("alice")
     alice_wallet = coordinator.get_wallet(ALICE)
     err = "Invalid PSBT: missing non_witness_utxo on a legacy input"
@@ -440,7 +438,7 @@ def test_023_psbt_rejects_without_prev_tx(coordinator, signer, state):
     assert not analysis["has_utxo"]
     assert_not_finalized(coordinator.backend, barepsbt)
     assert_next_role(coordinator.backend, barepsbt, "updater")
-    assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(barepsbt))
+    assert_send_rawtx_rejects(coordinator.backend, rawtx_from_psbt(barepsbt))
 
     # 2) only coordinator could repair the psbt
     updated = coordinator.backend.client.call("utxoupdatepsbt", barepsbt)
@@ -467,7 +465,7 @@ def test_023_psbt_rejects_without_prev_tx(coordinator, signer, state):
     assert analysis["fee"] == state["fee"]
     assert_not_finalized(coordinator.backend, declared)
     assert_next_role(coordinator.backend, declared, "updater")
-    assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(declared))
+    assert_send_rawtx_rejects(coordinator.backend, rawtx_from_psbt(declared))
 
 
 def test_024_psbt_malicious_prev_tx(coordinator, signer, state):
@@ -496,7 +494,7 @@ def test_024_psbt_malicious_prev_tx(coordinator, signer, state):
         coordinator.backend.client.decode_psbt(copied.to_string())
 
 
-def test_025_psbt_outputs_exceeds_inputs(coordinator, signer, state):
+def test_025_psbt_outputs_exceeds_inputs(coordinator, signer, state, rawtx_from_psbt):
     # Try to spend more than what is capable
     with raises(ClientError, match="Insufficient funds"):
         coordinator.get_wallet(ALICE).backend.client.wallet_create_funded_psbt(
@@ -519,11 +517,11 @@ def test_025_psbt_outputs_exceeds_inputs(coordinator, signer, state):
     assert_not_finalized(coordinator.backend, modified)
     assert_next_role(coordinator.backend, modified, "signer")
     assert_send_rawtx_rejects(
-        coordinator.backend, unsigned_hex(modified), "bad-txns-in-belowout"
+        coordinator.backend, rawtx_from_psbt(modified), "bad-txns-in-belowout"
     )
 
 
-def test_026_psbt_sighash(coordinator, signer, state):
+def test_026_psbt_sighash(coordinator, signer, state, rawtx_from_psbt):
     # similar to mitm above, change the sighash
     alice = signer("alice")
     alice_wallet = coordinator.get_wallet(ALICE)
@@ -554,7 +552,7 @@ def test_026_psbt_sighash(coordinator, signer, state):
         unsigned = _krux.psbt.to_string()
         assert_not_finalized(coordinator.backend, unsigned)
         assert_next_role(coordinator.backend, unsigned, next_role)
-        assert_send_rawtx_rejects(coordinator.backend, unsigned_hex(unsigned))
+        assert_send_rawtx_rejects(coordinator.backend, rawtx_from_psbt(unsigned))
 
 
 def test_027_psbt_sign(coordinator, signer, state):

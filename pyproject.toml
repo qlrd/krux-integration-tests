@@ -32,6 +32,11 @@ target-version = ["py312"]
 [tool.pylint.basic]
 no-docstring-rgx = "^(_|test_)"
 
+[tool.pylint.design]
+max-args = 7
+max-positional-arguments = 7
+max-locals = 16
+
 [tool.poe]
 executor.type = "uv"
 
