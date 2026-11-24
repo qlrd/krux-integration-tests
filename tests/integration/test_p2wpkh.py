@@ -29,8 +29,6 @@ Unsigned and output-tampering controls must be rejected by Core.
 Run the whole module: its ordered tests share the bornal lab and state.
 """
 
-from decimal import Decimal
-
 import pytest
 from bornal.testing import (
     COINBASE_MATURITY,
@@ -48,6 +46,7 @@ from bornal.testing import (
     sync_blocks,
 )
 from embit.hashes import hash160
+from embit.psbt import PSBT
 from embit.transaction import Transaction
 from krux.key import P2WPKH
 from krux.qr import FORMAT_NONE
@@ -62,24 +61,6 @@ def script_type():
     return P2WPKH
 
 
-@pytest.fixture(name="expected_summary")
-def fixture_expected_summary(to_formatted_btc):
-    """Complete review text for one P2WPKH input and two P2WPKH outputs."""
-
-    def _wrapper(input_sats, payment_sats, change_sats, percent):
-        fee_sats = input_sats - payment_sats - change_sats
-        # 113 base bytes plus 110 witness bytes (72-byte signature): 562 WU, 141 vB.
-        satvb = Decimal(fee_sats) / 141
-        return (
-            f"Inputs(1):{to_formatted_btc(input_sats)}"
-            f"Spend(1):{to_formatted_btc(payment_sats)}"
-            f"Self-transferorChange(1):{to_formatted_btc(change_sats)}"
-            f"Fee:{to_formatted_btc(fee_sats)}({percent}%)~{satvb:.1f}sat/vB"
-        )
-
-    return _wrapper
-
-
 def test_000_watchonly_segwit(core, coordinator, signer):
     assert_chain(core, "regtest")
     assert_chain(coordinator.backend, "regtest")
@@ -87,8 +68,6 @@ def test_000_watchonly_segwit(core, coordinator, signer):
     assert_wallet_info(wallet, "alice", watchonly=True)
     alice = wallet.client
     assert signer("alice").wallet.key.derivation == "m/84h/1h/0h"
-    # Core uses separate public descriptors for receiving addresses
-    # (internal=False) and change addresses (internal=True).
     descriptors = alice.call("listdescriptors")["descriptors"]
     assert len(descriptors) == 2
     assert {desc["internal"] for desc in descriptors} == {False, True}
@@ -121,7 +100,9 @@ def test_001_fund(core, coordinator, signer, state, to_btc, to_sats):
     state["mining_address"] = mining_address
 
 
-def test_002_create_psbt(core, coordinator, signer, state, to_btc, to_sats):
+def test_002_create_psbt(
+    core, coordinator, signer, state, to_btc, to_sats, unsigned_tx
+):
     alice = coordinator.get_wallet("alice").backend.client
     recipient = get_new_address(core, "recipient", "bech32")
     utxo = state["utxo"]
@@ -132,42 +113,47 @@ def test_002_create_psbt(core, coordinator, signer, state, to_btc, to_sats):
         {"change_type": "bech32", "fee_rate": 1},
     )
     decoded = alice.decode_psbt(funded["psbt"])
+    tx = unsigned_tx(decoded)
     assert len(decoded["inputs"]) == 1
-    assert len(decoded["tx"]["vout"]) == 2
-    (vin,) = decoded["tx"]["vin"]
-    assert (vin["txid"], vin["vout"]) == (utxo["txid"], utxo["vout"])
+    assert len(tx["vout"]) == 2
+    assert [(vin["txid"], vin["vout"]) for vin in tx["vin"]] == [
+        (utxo["txid"], utxo["vout"])
+    ]
     assert to_sats(decoded["inputs"][0]["witness_utxo"]["amount"]) == FUNDING_SATS
     assert funded["changepos"] in (0, 1)
-    change = decoded["tx"]["vout"][funded["changepos"]]
+    change = tx["vout"][funded["changepos"]]
     change_address = change["scriptPubKey"]["address"]
     assert change_address == next(
         signer("alice").wallet.obtain_addresses(branch_index=1)
     )
     assert alice.get_address_info(change_address)["ischange"] is True
-    fee = FUNDING_SATS - sum(to_sats(out["value"]) for out in decoded["tx"]["vout"])
+    fee = FUNDING_SATS - sum(to_sats(out["value"]) for out in tx["vout"])
     assert 0 < fee < 10_000
     assert fee == to_sats(funded["fee"]) == to_sats(decoded["fee"])
     state.update(
         psbt=funded["psbt"],
+        psbt_version=decoded["psbt_version"],
         recipient=recipient,
         change=change_address,
+        change_path=alice.account_path(change_address),
         change_sats=to_sats(change["value"]),
         fee_sats=fee,
-        unsigned_tx=decoded["tx"],
+        unsigned_tx=tx,
     )
 
 
-def test_003_review(signer, state, compact_text, expected_summary, to_formatted_btc):
+def test_003_review(signer, state, compact_text, to_full_summary, to_formatted_btc):
     messages, _ = signer("alice").as_signer(state["psbt"]).outputs()
     assert len(messages) == 3
     summary, spend, change = map(compact_text, messages)
     # This low-fee transaction exercises the 0.1% display minimum.
-    assert summary == expected_summary(
+    assert summary == to_full_summary(
         FUNDING_SATS, PAYMENT_SATS, state["change_sats"], "0.1"
     )
     assert spend == f"1.Spend:{state['recipient']}{to_formatted_btc(PAYMENT_SATS)}"
     assert change == (
-        f"1.Change:{state['change']}{to_formatted_btc(state['change_sats'])}"
+        f"1.Change:{state['change_path']}{state['change']}"
+        f"{to_formatted_btc(state['change_sats'])}"
     )
 
 
@@ -195,7 +181,7 @@ def test_004_unsigned_control(coordinator, signer, state, rawtx_from_psbt):
     )
 
 
-def test_005_sign_export(coordinator, signer, state, to_sats):
+def test_005_sign_export(coordinator, signer, state, to_sats, unsigned_tx):
     krux = signer("alice").as_signer(state["psbt"])
     assert krux.path_mismatch() == ""
     krux.sign()
@@ -204,9 +190,42 @@ def test_005_sign_export(coordinator, signer, state, to_sats):
     decoded = coordinator.backend.client.decode_psbt(exported)
     (inp,) = decoded["inputs"]
     assert list(inp["partial_signatures"]) == [signer("alice").get_pubkey(0, 0).hex()]
-    assert decoded["tx"] == state["unsigned_tx"]
+    assert decoded["psbt_version"] == state["psbt_version"]
+    assert unsigned_tx(decoded) == state["unsigned_tx"]
     assert to_sats(decoded["fee"]) == state["fee_sats"]
     state["exported"] = exported
+
+
+@pytest.mark.core_version(since="32.0")
+def test_005_psbt_v2_signer(coordinator, signer, state):
+    flags = ("inputs_modifiable", "outputs_modifiable", "has_sighash_single")
+    psbt = PSBT.from_string(state["psbt"])
+    psbt.set_tx_modifiable(0b011)
+    decoded = coordinator.backend.client.decode_psbt(psbt.to_string())
+    assert [decoded[flag] for flag in flags] == [True, True, False]
+
+    krux = signer("alice").as_signer(psbt)
+    krux.sign()
+    exported, _ = krux.psbt_qr()
+    decoded = coordinator.backend.client.decode_psbt(exported)
+    assert [decoded[flag] for flag in flags] == [False, False, False]
+
+
+@pytest.mark.core_version(since="32.0")
+def test_005_psbt_v0_on_core_32(coordinator, signer, state, to_btc):
+    alice = coordinator.get_wallet("alice")
+    psbt = alice.funded_psbt_v0(
+        [{"txid": state["utxo"]["txid"], "vout": state["utxo"]["vout"]}],
+        [{state["recipient"]: to_btc(PAYMENT_SATS)}],
+        {"change_type": "bech32", "fee_rate": 1},
+    )
+    exported = signer("alice").sign_psbt(psbt)
+    signed = alice.decode_psbt(exported)
+    assert (signed["psbt_version"], signed["tx"]) == (0, alice.decode_psbt(psbt)["tx"])
+    assert list(signed["inputs"][0]["partial_signatures"]) == [
+        signer("alice").get_pubkey(0, 0).hex()
+    ]
+    assert_mempool_accepts(alice.backend, assert_finalized(alice.backend, exported))
 
 
 def test_006_core_accepts(coordinator, state, to_sats):
@@ -274,8 +293,10 @@ def fixture_review_case(core, coordinator, state, fee_case, to_btc, to_sats):
         [{"txid": utxo["txid"], "vout": utxo["vout"]}],
         [{recipient: to_btc(output_sats - 10_000)}, {change: to_btc(10_000)}],
     )
+    psbt = alice.wallet_process_psbt(psbt, sign=False)["psbt"]
     return {
-        "psbt": alice.wallet_process_psbt(psbt, sign=False)["psbt"],
+        "psbt": psbt,
+        "decoded": alice.decode_psbt(psbt),
         "input_sats": input_sats,
         "output_sats": output_sats,
         "payment_sats": output_sats - 10_000,
@@ -284,6 +305,7 @@ def fixture_review_case(core, coordinator, state, fee_case, to_btc, to_sats):
         "percent": expected,
         "recipient": recipient,
         "change": change,
+        "change_path": alice.account_path(change),
     }
 
 
@@ -302,31 +324,32 @@ def fixture_review_case(core, coordinator, state, fee_case, to_btc, to_sats):
     ],
 )
 def test_008_review_fee_rounding(
-    coordinator,
     signer,
     review_case,
     to_sats,
     compact_text,
-    expected_summary,
+    to_full_summary,
     to_formatted_btc,
+    unsigned_tx,
 ):
     case = review_case
-    decoded = coordinator.backend.client.decode_psbt(case["psbt"])
+    decoded = case["decoded"]
     assert to_sats(decoded["fee"]) == case["fee_sats"]
     assert (
-        sum(to_sats(out["value"]) for out in decoded["tx"]["vout"])
+        sum(to_sats(out["value"]) for out in unsigned_tx(decoded)["vout"])
         == case["output_sats"]
     )
     # Only the displayed summary is asserted.
     # Krux's second result is for the high-fee warning.
     messages, _ = signer("alice").as_signer(case["psbt"]).outputs()
     assert list(map(compact_text, messages)) == [
-        expected_summary(
+        to_full_summary(
             case["input_sats"],
             case["payment_sats"],
             case["change_sats"],
             case["percent"],
         ),
         f"1.Spend:{case['recipient']}{to_formatted_btc(case['payment_sats'])}",
-        f"1.Change:{case['change']}{to_formatted_btc(case['change_sats'])}",
+        f"1.Change:{case['change_path']}{case['change']}"
+        f"{to_formatted_btc(case['change_sats'])}",
     ]

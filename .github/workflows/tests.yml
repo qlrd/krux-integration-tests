@@ -44,7 +44,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        bitcoin: ["29.2", "30.2", "31.1"]
+        bitcoin: ["29.2", "30.2", "31.1", "32.1"]
 
     steps:
 

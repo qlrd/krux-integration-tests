@@ -49,6 +49,7 @@ TrezorVectors = namedtuple(
 
 
 SATOSHIS = 100_000_000
+SEQUENCE_FINAL = 0xFFFFFFFF
 
 
 class Coordinator(BitcoindClient):
@@ -69,6 +70,15 @@ class Coordinator(BitcoindClient):
     def url(self) -> str:
         """Get wallet url by its own name"""
         return self.get_url(self.wallet_name)
+
+    def account_path(self, address: str) -> str:
+        """``<branch>/<index>`` of a wallet address"""
+        return "/".join(self.get_address_info(address)["hdkeypath"].split("/")[-2:])
+
+    def funded_psbt_v0(self, inputs: list, outputs: list, options: dict) -> str:
+        """``walletcreatefundedpsbt`` as PSBTv0"""
+        args = (inputs, outputs, 0, options, True, None, 0)
+        return self.call("walletcreatefundedpsbt", *args)["psbt"]
 
     def get_url(self, name: str | None = None) -> str:
         """Get wallet url by some name."""
@@ -133,6 +143,12 @@ class Signer:
         data = psbt.to_string() if isinstance(psbt, PSBT) else psbt
         return PSBTSigner(self.wallet, data, FORMAT_NONE)
 
+    def sign_psbt(self, psbt: PSBT | str) -> str:
+        """Sign with Krux and return exported PSBT"""
+        krux = self.as_signer(psbt)
+        krux.sign()
+        return krux.psbt_qr()[0]
+
 
 class BaseTest(IntegrationTest):
     """Hot ``core`` node plus a ``coordinator`` node with one wallet per signer"""
@@ -182,6 +198,43 @@ class BaseTest(IntegrationTest):
 def test_factory(script_type):
     """``BaseTest`` for bornal's module-scoped ``integration_test``."""
     return partial(BaseTest, script_type=script_type)
+
+
+def pytest_configure(config):
+    """Pytest marked for``core_version``"""
+    config.addinivalue_line(
+        "markers",
+        'core_version(since="X.Y", before="X.Y"): '
+        "run only on a Bitcoin Core in [since, before), skip otherwise",
+    )
+
+
+def _core_int(version: str) -> int:
+    parts = version.split(".")
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
+        raise ValueError(f'core_version marker expects "X.Y", got {version!r}')
+    major, minor = map(int, parts)
+    return major * 10_000 + minor * 100
+
+
+@pytest.fixture(scope="module")
+def core_version(integration_test) -> int:
+    """``getnetworkinfo`` version of the running Core (both backends share it)"""
+    return integration_test.backends[0].client.call("getnetworkinfo")["version"]
+
+
+@pytest.fixture(autouse=True)
+def core_version_gate(request):
+    """Skip a ``@pytest.mark.core_version`` test outside its Core range"""
+    marker = request.node.get_closest_marker("core_version")
+    if marker is None:
+        return
+    version = request.getfixturevalue("core_version")
+    since, before = marker.kwargs.get("since"), marker.kwargs.get("before")
+    if since is not None and version < _core_int(since):
+        pytest.skip(f"needs Bitcoin Core >= {since} (running {version})")
+    if before is not None and version >= _core_int(before):
+        pytest.skip(f"needs Bitcoin Core < {before} (running {version})")
 
 
 @pytest.fixture
@@ -255,12 +308,29 @@ def to_btc():
     return _wrapper
 
 
-@pytest.fixture
-def to_formatted_btc():
+@pytest.fixture(name="to_formatted_btc")
+def _to_formatted_btc():
     """Krux's review amount (``₿N.NNNNNNNN``) from integer sats"""
 
     def _wrapper(value: int) -> str:
         return f"₿{value // SATOSHIS}.{value % SATOSHIS:08d}"
+
+    return _wrapper
+
+
+@pytest.fixture
+def to_full_summary(to_formatted_btc):
+    """Krux's review summary"""
+
+    def _wrapper(input_sats, payment_sats, change_sats, percent):
+        fee_sats = input_sats - payment_sats - change_sats
+        satvb = Decimal(fee_sats) / 141
+        return (
+            f"Inputs(1):{to_formatted_btc(input_sats)}"
+            f"Spend(1):{to_formatted_btc(payment_sats)}"
+            f"Self-transferorChange(1):{to_formatted_btc(change_sats)}"
+            f"Fee:{to_formatted_btc(fee_sats)}({percent}%)~{satvb:.1f}sat/vB"
+        )
 
     return _wrapper
 
@@ -271,5 +341,43 @@ def compact_text():
 
     def _wrapper(text: str) -> str:
         return "".join(text.split())
+
+    return _wrapper
+
+
+@pytest.fixture
+def unsigned_tx():
+    """unsigned tx of a ``decodepsbt`` result (for before and after core v32)"""
+
+    def _wrapper(decoded: dict) -> dict:
+        # PSBT v0
+        if decoded["psbt_version"] == 0:
+            return decoded["tx"]
+        if decoded["psbt_version"] != 2:
+            raise ValueError(f"Unknown PSBT version: {decoded['psbt_version']}")
+
+        # PSBTv2
+        for inp in decoded["inputs"]:
+            if "time_locktime" in inp or "height_locktime" in inp:
+                raise NotImplementedError("PSBTv2 input requires a locktime")
+
+        return {
+            "version": decoded["tx_version"],
+            # BIP 370: an omitted PSBT_GLOBAL_FALLBACK_LOCKTIME is 0
+            "locktime": decoded.get("fallback_locktime", 0),
+            "vin": [
+                {
+                    "txid": inp["previous_txid"],
+                    "vout": inp["previous_vout"],
+                    # BIP 370: an omitted PSBT_IN_SEQUENCE is final
+                    "sequence": inp.get("sequence", SEQUENCE_FINAL),
+                }
+                for inp in decoded["inputs"]
+            ],
+            "vout": [
+                {"value": out["amount"], "n": n, "scriptPubKey": out["script"]}
+                for n, out in enumerate(decoded["outputs"])
+            ],
+        }
 
     return _wrapper

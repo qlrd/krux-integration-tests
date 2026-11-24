@@ -55,7 +55,7 @@ Build the daemon and run this test with the bornal's ``pytest`` plugin::
     pytest --build-bitcoin latest --wallet tests/integration/test_p2pkh.py
 """
 
-from pytest import fixture, raises
+from pytest import fixture, mark, raises
 
 from bornal.client import ClientError
 from bornal.plugins.bitcoind import UNSPENDABLE_ADDRESS
@@ -258,11 +258,31 @@ def test_012_create_unsigned_psbt(coordinator, state):
     state["fee"] = res["fee"]
 
 
-def test_013_check_spends_utxo(coordinator, state):
+def test_012_psbt_version(coordinator, state, core_version):
+    decoded = coordinator.backend.client.decode_psbt(state["psbt"])
+    assert decoded["psbt_version"] == (0 if core_version < 320000 else 2)
+
+
+@mark.core_version(since="32.0")
+def test_012_psbt_v0_on_core_32(coordinator, signer):
+    alice = coordinator.get_wallet(ALICE)
+    psbt = alice.funded_psbt_v0(
+        [], [{UNSPENDABLE_ADDRESS: PAYMENT}], {"change_type": "legacy", "fee_rate": 1}
+    )
+    exported = signer("alice").sign_psbt(psbt)
+    signed = alice.decode_psbt(exported)
+    assert (signed["psbt_version"], signed["tx"]) == (0, alice.decode_psbt(psbt)["tx"])
+    assert list(signed["inputs"][0]["partial_signatures"]) == [
+        signer("alice").get_pubkey(0, 1).hex()
+    ]
+    assert_mempool_accepts(alice.backend, assert_finalized(alice.backend, exported))
+
+
+def test_013_check_spends_utxo(coordinator, state, unsigned_tx):
     decoded = coordinator.backend.client.decode_psbt(state["psbt"])
 
     (utxo,) = coordinator.get_wallet(ALICE).backend.client.list_unspent()
-    (vin,) = decoded["tx"]["vin"]
+    (vin,) = unsigned_tx(decoded)["vin"]
     assert (vin["txid"], vin["vout"]) == (utxo["txid"], utxo["vout"])
 
     (inp,) = decoded["inputs"]
@@ -272,12 +292,12 @@ def test_013_check_spends_utxo(coordinator, state):
     assert prevout["scriptPubKey"]["address"] == state["address"]
 
 
-def test_014_psbt_change_address(coordinator, signer, state):
+def test_014_psbt_change_address(coordinator, signer, state, unsigned_tx):
     alice = signer("alice")
-    decoded = coordinator.backend.client.decode_psbt(state["psbt"])
+    tx = unsigned_tx(coordinator.backend.client.decode_psbt(state["psbt"]))
 
     changepos = state["changepos"]
-    core_change = decoded["tx"]["vout"][changepos]["scriptPubKey"]["address"]
+    core_change = tx["vout"][changepos]["scriptPubKey"]["address"]
     krux_change = next(alice.wallet.obtain_addresses(branch_index=1))
     assert core_change == krux_change
 
@@ -290,10 +310,10 @@ def test_014_psbt_change_address(coordinator, signer, state):
     state["change"] = core_change
 
 
-def test_015_psbt_outputs(coordinator, state):
-    decoded = coordinator.backend.client.decode_psbt(state["psbt"])
+def test_015_psbt_outputs(coordinator, state, unsigned_tx):
+    tx = unsigned_tx(coordinator.backend.client.decode_psbt(state["psbt"]))
 
-    outs = {o["scriptPubKey"]["address"]: o["value"] for o in decoded["tx"]["vout"]}
+    outs = {o["scriptPubKey"]["address"]: o["value"] for o in tx["vout"]}
     assert set(outs) == {UNSPENDABLE_ADDRESS, state["change"]}
     assert outs[UNSPENDABLE_ADDRESS] == PAYMENT
     assert round(sum(outs.values()) + state["fee"], 8) == FUNDING
@@ -521,14 +541,13 @@ def test_025_psbt_outputs_exceeds_inputs(coordinator, signer, state, rawtx_from_
     )
 
 
-def test_026_psbt_sighash(coordinator, signer, state, rawtx_from_psbt):
+def test_026_psbt_sighash(coordinator, signer, state, rawtx_from_psbt, core_version):
     # similar to mitm above, change the sighash
     alice = signer("alice")
     alice_wallet = coordinator.get_wallet(ALICE)
     cases = [("NONE", "0x02"), ("SINGLE", "0x03"), ("ALL|ANYONECANPAY", "0x81")]
     # Core 29 reports these unsigned inputs as signer-ready; 30+ reports updater.
-    version = coordinator.backend.client.call("getnetworkinfo")["version"]
-    next_role = "signer" if version < 300000 else "updater"
+    next_role = "signer" if core_version < 300000 else "updater"
 
     # for each sighash, check in both krux and core the signs of malicious psbt
     for sighash, _hex in cases:
