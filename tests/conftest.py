@@ -33,7 +33,7 @@ from embit.descriptor import checksum
 from embit.networks import NETWORKS
 from embit.psbt import PSBT
 
-from krux.key import Key, P2PKH, TYPE_SINGLESIG
+from krux.key import Key, P2PKH, P2SH, TYPE_MULTISIG, TYPE_SINGLESIG
 from krux.psbt import PSBTSigner
 from krux.qr import FORMAT_NONE
 from krux.wallet import Wallet
@@ -120,10 +120,14 @@ class Signer:
         policy=TYPE_SINGLESIG,
         network=None,
         script=P2PKH,
+        *,
+        account_index: int | None = 0,
     ) -> "Signer":
         """create a new krux based signer/wallet"""
         network = network or NETWORKS["regtest"]
-        key = Key(mnemonic, policy, network, script_type=script)
+        key = Key(
+            mnemonic, policy, network, account_index=account_index, script_type=script
+        )
         return cls(Wallet(key))
 
     def as_variant(self, policy, network, script) -> "Signer":
@@ -165,11 +169,7 @@ class BaseTest(IntegrationTest):
         """Declare the airgap signers and two listening ``bitcoin-core`` nodes"""
         self.state = {}
 
-        # Prepare some 'airgap' wallets (regtest only)
-        self.signers = {
-            name: Signer.from_mnemonic(mnemonic, script=self.script_type)
-            for (name, mnemonic) in TrezorVectors()._asdict().items()
-        }
+        self.signers = self._make_signers()
 
         # Initialized nodes. The first one will be a hot wallet managed
         # by bornal itself. The second will be watchonly that can load
@@ -177,6 +177,12 @@ class BaseTest(IntegrationTest):
         # in `self.signers`
         self.add_backend("bitcoin-core", p2p_port=free_port())
         self.add_backend("bitcoin-core", p2p_port=free_port())
+
+    def _make_signers(self):
+        return {
+            name: Signer.from_mnemonic(mnemonic, script=self.script_type)
+            for name, mnemonic in TrezorVectors()._asdict().items()
+        }
 
     def run_test(self):
         """Backends are up: one watch-only wallet per signer on the second node"""
@@ -194,10 +200,35 @@ class BaseTest(IntegrationTest):
         self.coordinator.import_watchonly_wallets(names, requests)
 
 
+class P2SHTest(BaseTest):
+    """Use the shared watch-only coordinator with a 2-of-2 descriptor."""
+
+    def _make_signers(self):
+        signers = {
+            name: Signer.from_mnemonic(
+                mnemonic,
+                policy=TYPE_MULTISIG,
+                network=NETWORKS["test"],
+                script=P2SH,
+                account_index=None,
+            )
+            for name, mnemonic in TrezorVectors()._asdict().items()
+        }
+        expressions = ",".join(
+            cosigner.wallet.key.key_expression() + "/<0;1>/*"
+            for cosigner in signers.values()
+        )
+        descriptor = f"sh(sortedmulti(2,{expressions}))"
+        for cosigner in signers.values():
+            cosigner.wallet.load(descriptor, FORMAT_NONE)
+        return signers
+
+
 @pytest.fixture(scope="module")
 def test_factory(script_type):
     """``BaseTest`` for bornal's module-scoped ``integration_test``."""
-    return partial(BaseTest, script_type=script_type)
+    lab = P2SHTest if script_type == P2SH else BaseTest
+    return partial(lab, script_type=script_type)
 
 
 def pytest_configure(config):
